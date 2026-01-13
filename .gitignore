@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+npm-debug.log
+yarn-error.log
+pnpm-debug.log
+
+# Environment variables
+.env
+.env.*
+!.env.example
+!.env.dev.example
+!.env.prod.example
+
+# Build outputs
+dist/
+build/
+coverage/
+
+# System
+.DS_Store
+Thumbs.db
