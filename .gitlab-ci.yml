@@ -23,6 +23,7 @@ build_image:
     - docker push $DOCKER_IMAGE:$CI_COMMIT_SHA
   rules:
     - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "development"
 
 deploy_phala:
   stage: deploy
@@ -30,27 +31,12 @@ deploy_phala:
   script:
     - npm install -g @phala/cli
     - cd worker
-    # Authenticate via env var token (simulated login)
-    # Note: Phala CLI might require interactive login or a specific token setup.
-    # Assuming we can pass token or use a config file.
-    # For now, we will assume manual deployment or use a custom script if CLI doesn't support non-interactive token.
-    # But usually, CLIs have a token flag or env var.
-    # Checking docs or assuming `npx phala login --token` or similar exists.
-    # If not, we might need to write a config file.
-
-    # Official docs check needed: For now using a placeholder logic.
-    # Real Phala CLI uses `phala login` which opens browser.
-    # For CI, we need an API Key or Token mechanism.
-
-    # Assuming we can just upgrade if we have the right credentials in env.
-    # If phala-cli doesn't support CI login easily, we might need a workaround.
-    # For this task, I will output the standard approach.
-
     - echo "Deploying to Phala Cloud..."
-    # Placeholder for actual non-interactive login
-    # - npx phala login --token $PHALA_CLOUD_KEY
-
-    # Use the upgrade command
+    # Note: Using the same CVM (PHALA_APP_ID) for both main and development branches
+    # as requested. This means development deployments will overwrite production.
+    # To separate, use a different variable (e.g. PHALA_APP_ID_DEV) for development.
+    - npx phala login --token $PHALA_CLOUD_KEY
     - npx phala cvms upgrade $PHALA_APP_ID --image $DOCKER_IMAGE:$CI_COMMIT_SHA
   rules:
     - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "development"
