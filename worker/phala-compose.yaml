@@ -1,6 +1,6 @@
 services:
   verifiable-wallet-service:
-    image: phantasybot/verifiable-wallet-service:v0.0.1
+    image: phantasybot/verifiable-wallet-service:v0.1.3
     ports:
       - '3000:3000'
     environment:
