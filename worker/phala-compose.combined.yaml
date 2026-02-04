@@ -1,0 +1,58 @@
+services:
+  # Production service (mainnet)
+  wallet-prod:
+    image: phantasybot/verifiable-wallet-service:v0.1.0-BETA
+    ports:
+      - '3000:3000'
+    environment:
+      - PORT=3000
+      - NODE_ENV=production
+      - APP_VERSION=0.1.0-BETA
+      - APP_ENVIRONMENT=production
+      - WALLET_SERVICE_SECRET=${WALLET_SERVICE_SECRET:-}
+      - PHALA_TEE=${PHALA_TEE:-true}
+      - HELIUS_RPC_URL=${HELIUS_RPC_URL:-}
+      - ALCHEMY_RPC_URL=${ALCHEMY_RPC_URL:-}
+      - SOLANA_RPC_URL=${SOLANA_RPC_URL:-https://api.mainnet-beta.solana.com}
+      - WALLET_LABELS_PATH=/app/data/wallet-labels.json
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - wallet-data-prod:/app/data
+    restart: always
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:3000/health']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Development service (devnet)
+  wallet-dev:
+    image: phantasybot/verifiable-wallet-service:v0.1.0-BETA
+    ports:
+      - '3001:3001'
+    environment:
+      - PORT=3001
+      - NODE_ENV=development
+      - APP_VERSION=0.1.0-BETA
+      - APP_ENVIRONMENT=development
+      - WALLET_SERVICE_SECRET=${WALLET_SERVICE_SECRET_DEV:-dev-secret}
+      - PHALA_TEE=${PHALA_TEE:-true}
+      - HELIUS_RPC_URL=${HELIUS_RPC_URL:-}
+      - ALCHEMY_RPC_URL=${ALCHEMY_RPC_URL:-}
+      - SOLANA_RPC_URL=https://api.devnet.solana.com
+      - WALLET_LABELS_PATH=/app/data/wallet-labels.json
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - wallet-data-dev:/app/data
+    restart: always
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:3001/health']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  wallet-data-prod:
+  wallet-data-dev:
