@@ -1,7 +1,7 @@
 services:
   # Production service (mainnet)
   wallet-prod:
-    image: phantasybot/verifiable-wallet-service:v0.1.0-BETA
+    image: phantasybot/verifiable-wallet-service:v0.1.0-SECURITY
     ports:
       - '3000:3000'
     environment:
@@ -28,7 +28,7 @@ services:
 
   # Development service (devnet)
   wallet-dev:
-    image: phantasybot/verifiable-wallet-service:v0.1.0-BETA
+    image: phantasybot/verifiable-wallet-service:v0.1.0-SECURITY
     ports:
       - '3001:3001'
     environment:

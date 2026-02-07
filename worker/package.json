@@ -1,6 +1,6 @@
 {
   "name": "verifiable-wallet-service",
-  "version": "0.0.1-BETA",
+  "version": "0.1.0-SECURITY",
   "description": "Secure TEE Wallet Service for Mystery Gift Vault",
   "main": "dist/index.js",
   "scripts": {
