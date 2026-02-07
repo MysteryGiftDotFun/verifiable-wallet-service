@@ -7,7 +7,7 @@ services:
     environment:
       - PORT=3000
       - NODE_ENV=production
-      - APP_VERSION=0.1.0-BETA
+      - APP_VERSION=0.1.0-SECURITY
       - APP_ENVIRONMENT=production
       - WALLET_SERVICE_SECRET=${WALLET_SERVICE_SECRET:-}
       - PHALA_TEE=${PHALA_TEE:-true}
@@ -34,7 +34,7 @@ services:
     environment:
       - PORT=3001
       - NODE_ENV=development
-      - APP_VERSION=0.1.0-BETA
+      - APP_VERSION=0.1.0-SECURITY
       - APP_ENVIRONMENT=development
       - WALLET_SERVICE_SECRET=${WALLET_SERVICE_SECRET_DEV:-dev-secret}
       - PHALA_TEE=${PHALA_TEE:-true}
