@@ -17,6 +17,9 @@ import {
   mintTo,
   setAuthority,
   createTransferInstruction,
+  getAssociatedTokenAddress,
+  TOKEN_PROGRAM_ID,
+  ASSOCIATED_TOKEN_PROGRAM_ID,
 } from '@solana/spl-token';
 import {
   createCreateMasterEditionV3Instruction,
@@ -45,12 +48,69 @@ const authMiddleware = (
 };
 
 const VALID_PURPOSES = new Set(['vault', 'giveaway']);
+
+// USDC Configuration
+const USDC_MAINNET_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+const USDC_DEVNET_MINT = '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU';
+const USDC_DECIMALS = 6;
 const LABELS_PATH =
   process.env.WALLET_LABELS_PATH || path.join(process.cwd(), 'data', 'wallet-labels.json');
 const MAX_LABEL_LENGTH = 120;
 const TOKEN_METADATA_PROGRAM_ID = new PublicKey('metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s');
 const MAX_METADATA_NAME = 32;
 const MAX_METADATA_SYMBOL = 10;
+
+// Rate limiting configuration
+const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+const RATE_LIMIT_MAX_REQUESTS = 10; // Max 10 USDC transfers per hour per IP
+const DAILY_LIMIT_USD = 50000; // $50,000 daily aggregate limit
+
+// In-memory rate limiting store (per-IP)
+const rateLimitStore = new Map<string, { count: number; resetTime: number }>();
+
+// Daily aggregate tracking
+let dailyTransferredUsd = 0;
+let dailyResetTime = Date.now() + 24 * 60 * 60 * 1000;
+
+function resetDailyLimitIfNeeded(): void {
+  const now = Date.now();
+  if (now >= dailyResetTime) {
+    dailyTransferredUsd = 0;
+    dailyResetTime = now + 24 * 60 * 60 * 1000;
+    console.log('[TEE] Daily transfer limit reset');
+  }
+}
+
+function checkRateLimit(ip: string): { allowed: boolean; retryAfter?: number } {
+  const now = Date.now();
+  const record = rateLimitStore.get(ip);
+
+  if (!record || now >= record.resetTime) {
+    rateLimitStore.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW_MS });
+    return { allowed: true };
+  }
+
+  if (record.count >= RATE_LIMIT_MAX_REQUESTS) {
+    const retryAfter = Math.ceil((record.resetTime - now) / 1000);
+    return { allowed: false, retryAfter };
+  }
+
+  record.count += 1;
+  return { allowed: true };
+}
+
+function getClientIp(req: express.Request): string {
+  // Check X-Forwarded-For header (common for proxied requests)
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string') {
+    return forwarded.split(',')[0].trim();
+  }
+  if (Array.isArray(forwarded) && forwarded.length > 0) {
+    return forwarded[0].split(',')[0].trim();
+  }
+  // Fallback to socket address
+  return req.socket?.remoteAddress || 'unknown';
+}
 
 const rpcUrls = [
   process.env.HELIUS_RPC_URL,
@@ -435,6 +495,193 @@ app.post('/transfer-nft', authMiddleware, async (req, res) => {
   }
 });
 
+/**
+ * Transfer USDC from vault to a recipient.
+ * Used for automated buyback payouts.
+ *
+ * Body: { recipient: string; amountUsd: number; memo?: string }
+ */
+app.post('/transfer-usdc', authMiddleware, async (req, res) => {
+  try {
+    // Rate limiting check
+    const clientIp = getClientIp(req);
+    const rateCheck = checkRateLimit(clientIp);
+    if (!rateCheck.allowed) {
+      console.warn(`[TEE] Rate limit exceeded for IP: ${clientIp}`);
+      return res.status(429).json({
+        error: 'Too many transfer requests. Please try again later.',
+        retryAfter: rateCheck.retryAfter,
+      });
+    }
+
+    // Daily aggregate limit check
+    resetDailyLimitIfNeeded();
+
+    const { recipient, amountUsd, memo } = req.body as {
+      recipient?: string;
+      amountUsd?: number;
+      memo?: string;
+    };
+
+    if (!recipient) {
+      return res.status(400).json({ error: 'recipient is required' });
+    }
+
+    if (!amountUsd || amountUsd <= 0) {
+      return res.status(400).json({ error: 'amountUsd must be a positive number' });
+    }
+
+    // Safety limit: max $10,000 per transfer to prevent catastrophic errors
+    const MAX_TRANSFER_USD = 10000;
+    if (amountUsd > MAX_TRANSFER_USD) {
+      return res.status(400).json({
+        error: `Amount exceeds maximum single transfer limit of $${MAX_TRANSFER_USD}`,
+      });
+    }
+
+    // Check daily aggregate limit
+    if (dailyTransferredUsd + amountUsd > DAILY_LIMIT_USD) {
+      console.warn(`[TEE] Daily limit would be exceeded: current=$${dailyTransferredUsd}, requested=$${amountUsd}, limit=$${DAILY_LIMIT_USD}`);
+      return res.status(400).json({
+        error: `Daily transfer limit would be exceeded. Limit: $${DAILY_LIMIT_USD}, Used: $${dailyTransferredUsd.toFixed(2)}, Requested: $${amountUsd}`,
+        dailyUsed: dailyTransferredUsd,
+        dailyLimit: DAILY_LIMIT_USD,
+      });
+    }
+
+    const connection = new Connection(getRpcUrl(), 'confirmed');
+    const vaultKeypair = await getVaultKey('vault');
+
+    // Determine USDC mint based on network
+    const rpcUrl = getRpcUrl();
+    const isMainnet = rpcUrl.includes('mainnet');
+    const usdcMint = new PublicKey(isMainnet ? USDC_MAINNET_MINT : USDC_DEVNET_MINT);
+
+    const recipientKey = new PublicKey(recipient);
+
+    // Convert USD to USDC amount (6 decimals)
+    const amountRaw = BigInt(Math.floor(amountUsd * Math.pow(10, USDC_DECIMALS)));
+
+    console.log(`[TEE] Initiating USDC transfer: $${amountUsd} to ${recipient}`);
+    if (memo) {
+      console.log(`[TEE] Memo: ${memo}`);
+    }
+
+    // Get source ATA (vault's USDC account)
+    const sourceAta = await getAssociatedTokenAddress(usdcMint, vaultKeypair.publicKey);
+
+    // Check vault USDC balance
+    try {
+      const balance = await connection.getTokenAccountBalance(sourceAta);
+      const vaultBalance = Number(balance.value.amount) / Math.pow(10, USDC_DECIMALS);
+      if (vaultBalance < amountUsd) {
+        return res.status(400).json({
+          error: `Insufficient USDC balance. Vault has $${vaultBalance.toFixed(2)}, requested $${amountUsd}`,
+          vaultBalance,
+        });
+      }
+      console.log(`[TEE] Vault USDC balance: $${vaultBalance.toFixed(2)}`);
+    } catch (e) {
+      return res.status(400).json({
+        error: 'Vault has no USDC token account',
+      });
+    }
+
+    // Get or create destination ATA
+    const destAta = await withRetry(
+      () => getOrCreateAssociatedTokenAccount(connection, vaultKeypair, usdcMint, recipientKey),
+      'get destination USDC ATA'
+    );
+
+    // Build and send transfer transaction
+    const sig = await withRetry(
+      () =>
+        sendAndConfirmTransaction(
+          connection,
+          new Transaction().add(
+            createTransferInstruction(
+              sourceAta,
+              destAta.address,
+              vaultKeypair.publicKey,
+              amountRaw
+            )
+          ),
+          [vaultKeypair],
+          { commitment: 'confirmed' }
+        ),
+      'transfer USDC'
+    );
+
+    console.log(`[TEE] USDC transfer completed: ${sig}`);
+
+    // Update daily aggregate after successful transfer
+    dailyTransferredUsd += amountUsd;
+    console.log(`[TEE] Daily transferred total: $${dailyTransferredUsd.toFixed(2)} / $${DAILY_LIMIT_USD}`);
+
+    res.json({
+      success: true,
+      signature: sig,
+      amount: amountUsd,
+      recipient,
+      memo: memo || null,
+    });
+  } catch (error: any) {
+    console.error('[TEE] USDC transfer failed:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Get vault USDC balance
+ */
+app.get('/usdc-balance', authMiddleware, async (req, res) => {
+  try {
+    const purpose = (req.query?.purpose as string) || 'vault';
+    if (!VALID_PURPOSES.has(purpose)) {
+      return res.status(400).json({ error: 'Invalid purpose' });
+    }
+
+    const connection = new Connection(getRpcUrl(), 'confirmed');
+    const keypair = await getVaultKey(purpose);
+
+    // Determine USDC mint based on network
+    const rpcUrl = getRpcUrl();
+    const isMainnet = rpcUrl.includes('mainnet');
+    const usdcMint = new PublicKey(isMainnet ? USDC_MAINNET_MINT : USDC_DEVNET_MINT);
+
+    const ata = await getAssociatedTokenAddress(usdcMint, keypair.publicKey);
+
+    try {
+      const balance = await connection.getTokenAccountBalance(ata);
+      const usdBalance = Number(balance.value.amount) / Math.pow(10, USDC_DECIMALS);
+
+      res.json({
+        success: true,
+        balance: usdBalance,
+        balanceRaw: balance.value.amount,
+        decimals: USDC_DECIMALS,
+        usdcMint: usdcMint.toBase58(),
+        wallet: keypair.publicKey.toBase58(),
+        tokenAccount: ata.toBase58(),
+      });
+    } catch (e) {
+      // No USDC account exists
+      res.json({
+        success: true,
+        balance: 0,
+        balanceRaw: '0',
+        decimals: USDC_DECIMALS,
+        usdcMint: usdcMint.toBase58(),
+        wallet: keypair.publicKey.toBase58(),
+        tokenAccount: null,
+        message: 'No USDC token account exists for this wallet',
+      });
+    }
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 function getDashboardHtml(): string {
   const version = process.env.APP_VERSION || '0.1.0';
   const environment = process.env.APP_ENVIRONMENT || 'development';
@@ -696,6 +943,18 @@ function getDashboardHtml(): string {
               <span class="path">/sign-transaction</span>
               <p class="desc">Sign transaction in TEE (auth required)</p>
             </div>
+
+            <div class="endpoint">
+              <span class="method post">POST</span>
+              <span class="path">/transfer-usdc</span>
+              <p class="desc">Transfer USDC from vault for buyback payouts (auth required)</p>
+            </div>
+
+            <div class="endpoint">
+              <span class="method get">GET</span>
+              <span class="path">/usdc-balance</span>
+              <p class="desc">Get vault USDC balance (auth required)</p>
+            </div>
           </div>
         </div>
 
@@ -912,6 +1171,91 @@ app.get('/dashboard', (_req, res) => {
 });
 
 /**
+ * Validate that a transaction only contains allowed instructions.
+ * Returns null if valid, or an error message if invalid.
+ */
+async function validateTransactionInstructions(
+  transaction: Transaction,
+  vaultPublicKey: PublicKey
+): Promise<string | null> {
+  const instructions = transaction.instructions;
+
+  if (instructions.length === 0) {
+    return 'Transaction has no instructions';
+  }
+
+  // Maximum 3 instructions (ATA creation + transfer + optional memo)
+  if (instructions.length > 3) {
+    return `Too many instructions: ${instructions.length} (max 3)`;
+  }
+
+  for (let i = 0; i < instructions.length; i++) {
+    const ix = instructions[i];
+    const programId = ix.programId;
+
+    // Allow: Token Program (for transfers)
+    if (programId.equals(TOKEN_PROGRAM_ID)) {
+      // Decode instruction type - first byte indicates instruction type
+      const instructionType = ix.data[0];
+
+      // Token Program instruction types:
+      // 3 = Transfer, 12 = TransferChecked
+      if (instructionType !== 3 && instructionType !== 12) {
+        return `Invalid Token instruction type: ${instructionType}. Only Transfer (3) or TransferChecked (12) allowed`;
+      }
+
+      // For Transfer instruction, validate source account
+      // Keys: [0]=source, [1]=destination, [2]=authority
+      if (ix.keys.length < 3) {
+        return 'Invalid Transfer instruction: insufficient accounts';
+      }
+
+      const authority = ix.keys[2].pubkey;
+      if (!authority.equals(vaultPublicKey)) {
+        return `Invalid authority: ${authority.toBase58()}. Expected vault: ${vaultPublicKey.toBase58()}`;
+      }
+
+      continue;
+    }
+
+    // Allow: Associated Token Program (for ATA creation)
+    if (programId.equals(ASSOCIATED_TOKEN_PROGRAM_ID)) {
+      // ATA creation is allowed - vault may need to create recipient ATA
+      // Keys: [0]=payer, [1]=ata, [2]=owner, [3]=mint, [4]=system, [5]=token
+      if (ix.keys.length < 4) {
+        return 'Invalid ATA instruction: insufficient accounts';
+      }
+
+      // Verify payer is the vault
+      const payer = ix.keys[0].pubkey;
+      if (!payer.equals(vaultPublicKey)) {
+        return `Invalid ATA payer: ${payer.toBase58()}. Expected vault: ${vaultPublicKey.toBase58()}`;
+      }
+
+      continue;
+    }
+
+    // Allow: System Program (for rent-exempt ATA creation)
+    const SYSTEM_PROGRAM_ID = new PublicKey('11111111111111111111111111111111');
+    if (programId.equals(SYSTEM_PROGRAM_ID)) {
+      // System program calls are typically part of ATA creation
+      continue;
+    }
+
+    // Allow: Compute Budget Program (for priority fees)
+    const COMPUTE_BUDGET_ID = new PublicKey('ComputeBudget111111111111111111111111111111');
+    if (programId.equals(COMPUTE_BUDGET_ID)) {
+      continue;
+    }
+
+    // Reject any other program
+    return `Unauthorized program: ${programId.toBase58()}`;
+  }
+
+  return null; // Valid
+}
+
+/**
  * Sign a transaction constructed by the Marketplace API.
  *
  * Body: { transactionBase64: string }
@@ -935,10 +1279,15 @@ app.post('/sign-transaction', authMiddleware, async (req, res) => {
     // 2. Get Secure Key
     const keypair = await getVaultKey(purpose);
 
-    // 3. Security Check (Optional but recommended)
-    // Ensure we are only signing specific types of txs?
-    // For now, we trust the Marketplace API via SERVICE_SECRET.
-    // Future: Inspect instructions to ensure it's a valid NFT transfer.
+    // 3. Security Check: Validate transaction instructions
+    const validationError = await validateTransactionInstructions(transaction, keypair.publicKey);
+    if (validationError) {
+      console.error(`[TEE] Transaction validation failed: ${validationError}`);
+      return res.status(400).json({
+        error: 'Transaction validation failed',
+        reason: validationError,
+      });
+    }
 
     // 4. Partial Sign
     transaction.partialSign(keypair);
