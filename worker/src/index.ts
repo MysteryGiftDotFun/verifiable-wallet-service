@@ -32,7 +32,7 @@ app.use(express.json());
 app.use(cors());
 
 // Internal Secret to protect this service
-const SERVICE_SECRET = process.env.WALLET_SERVICE_SECRET || 'dev-secret';
+const SERVICE_SECRET = process.env.WALLET_SERVICE_SECRET || '';
 
 // Middleware
 const authMiddleware = (
@@ -1110,17 +1110,35 @@ function getDashboardHtml(): string {
     }
 
     function renderWallets(wallets) {
+      walletsContainer.innerHTML = '';
       if (!wallets.length) {
-        walletsContainer.innerHTML = '<p style="font-size:0.8rem; color:var(--text-muted); text-align:center; padding:2rem 0;">No wallets found.</p>';
+        const p = document.createElement('p');
+        p.style.cssText = 'font-size:0.8rem; color:var(--text-muted); text-align:center; padding:2rem 0;';
+        p.textContent = 'No wallets found.';
+        walletsContainer.appendChild(p);
         return;
       }
-      walletsContainer.innerHTML = wallets.map(wallet => \`
-        <div class="wallet-card">
-          <div class="wallet-purpose">\${wallet.purpose}</div>
-          <div class="wallet-address">\${wallet.publicKey}</div>
-          <input type="text" class="sleek-input" data-purpose="\${wallet.purpose}" value="\${wallet.label || ''}" placeholder="Wallet label (optional)" style="margin-bottom:0;">
-        </div>
-      \`).join('');
+      wallets.forEach(wallet => {
+        const card = document.createElement('div');
+        card.className = 'wallet-card';
+        const purpose = document.createElement('div');
+        purpose.className = 'wallet-purpose';
+        purpose.textContent = wallet.purpose;
+        const address = document.createElement('div');
+        address.className = 'wallet-address';
+        address.textContent = wallet.publicKey;
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'sleek-input';
+        input.dataset.purpose = wallet.purpose;
+        input.value = wallet.label || '';
+        input.placeholder = 'Wallet label (optional)';
+        input.style.marginBottom = '0';
+        card.appendChild(purpose);
+        card.appendChild(address);
+        card.appendChild(input);
+        walletsContainer.appendChild(card);
+      });
     }
 
     async function saveLabels() {
