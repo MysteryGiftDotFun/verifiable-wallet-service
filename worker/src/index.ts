@@ -3,6 +3,7 @@ import express from "express";
 import cors from "cors";
 import { promises as fs } from "fs";
 import path from "path";
+import Redis from "ioredis";
 import {
   Connection,
   Keypair,
@@ -100,13 +101,56 @@ const MAX_METADATA_SYMBOL = 10;
 
 // Rate limiting configuration
 const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+const RATE_LIMIT_WINDOW_SECS = 3600;
 const RATE_LIMIT_MAX_REQUESTS = 10; // Max 10 USDC transfers per hour per IP
 const DAILY_LIMIT_USD = 50000; // $50,000 daily aggregate limit
 
-// In-memory rate limiting store (per-IP)
-const rateLimitStore = new Map<string, { count: number; resetTime: number }>();
+// Redis client for persistent rate limits
+let redis: Redis | null = null;
+let redisAvailable = false;
 
-// Daily aggregate tracking
+function initRedis(): void {
+  const redisUrl = process.env.REDIS_URL;
+  if (!redisUrl) {
+    console.warn("[TEE] REDIS_URL not set, using in-memory rate limits (resets on restart)");
+    return;
+  }
+
+  redis = new Redis(redisUrl, {
+    maxRetriesPerRequest: 3,
+    retryStrategy(times) {
+      if (times > 10) return null;
+      return Math.min(times * 200, 5000);
+    },
+    lazyConnect: true,
+  });
+
+  redis.on("connect", () => {
+    redisAvailable = true;
+    console.log("[TEE] Redis connected — rate limits and daily caps are persistent");
+  });
+
+  redis.on("error", (err) => {
+    if (redisAvailable) {
+      console.error("[TEE] Redis error, falling back to in-memory:", err.message);
+    }
+    redisAvailable = false;
+  });
+
+  redis.on("close", () => {
+    redisAvailable = false;
+    console.warn("[TEE] Redis connection closed, falling back to in-memory");
+  });
+
+  redis.connect().catch((err) => {
+    console.warn("[TEE] Redis initial connection failed, using in-memory:", err.message);
+  });
+}
+
+initRedis();
+
+// In-memory fallback stores
+const rateLimitStore = new Map<string, { count: number; resetTime: number }>();
 let dailyTransferredUsd = 0;
 let dailyResetTime = Date.now() + 24 * 60 * 60 * 1000;
 
@@ -115,11 +159,39 @@ function resetDailyLimitIfNeeded(): void {
   if (now >= dailyResetTime) {
     dailyTransferredUsd = 0;
     dailyResetTime = now + 24 * 60 * 60 * 1000;
-    console.log("[TEE] Daily transfer limit reset");
+    console.log("[TEE] Daily transfer limit reset (in-memory)");
   }
 }
 
-function checkRateLimit(ip: string): { allowed: boolean; retryAfter?: number } {
+/** Returns seconds until midnight UTC */
+function secondsUntilMidnightUtc(): number {
+  const now = new Date();
+  const midnight = new Date(now);
+  midnight.setUTCDate(midnight.getUTCDate() + 1);
+  midnight.setUTCHours(0, 0, 0, 0);
+  return Math.ceil((midnight.getTime() - now.getTime()) / 1000);
+}
+
+async function checkRateLimit(ip: string): Promise<{ allowed: boolean; retryAfter?: number }> {
+  if (redisAvailable && redis) {
+    try {
+      const key = `ratelimit:${ip}`;
+      const count = await redis.incr(key);
+      if (count === 1) {
+        // First request in window — set expiry
+        await redis.expire(key, RATE_LIMIT_WINDOW_SECS);
+      }
+      if (count > RATE_LIMIT_MAX_REQUESTS) {
+        const ttl = await redis.ttl(key);
+        return { allowed: false, retryAfter: ttl > 0 ? ttl : RATE_LIMIT_WINDOW_SECS };
+      }
+      return { allowed: true };
+    } catch {
+      // Redis failed, fall through to in-memory
+    }
+  }
+
+  // In-memory fallback
   const now = Date.now();
   const record = rateLimitStore.get(ip);
 
@@ -135,6 +207,39 @@ function checkRateLimit(ip: string): { allowed: boolean; retryAfter?: number } {
 
   record.count += 1;
   return { allowed: true };
+}
+
+async function getDailyTransferred(): Promise<number> {
+  if (redisAvailable && redis) {
+    try {
+      const val = await redis.get("daily_transferred_usd");
+      return val ? parseFloat(val) : 0;
+    } catch {
+      // Fall through to in-memory
+    }
+  }
+  resetDailyLimitIfNeeded();
+  return dailyTransferredUsd;
+}
+
+async function addDailyTransferred(amountUsd: number): Promise<void> {
+  if (redisAvailable && redis) {
+    try {
+      const key = "daily_transferred_usd";
+      const newVal = await redis.incrbyfloat(key, amountUsd);
+      // Set TTL to midnight UTC if not already set
+      const ttl = await redis.ttl(key);
+      if (ttl < 0) {
+        await redis.expire(key, secondsUntilMidnightUtc());
+      }
+      console.log(`[TEE] Daily transferred total (Redis): $${parseFloat(String(newVal)).toFixed(2)} / $${DAILY_LIMIT_USD}`);
+      return;
+    } catch {
+      // Fall through to in-memory
+    }
+  }
+  dailyTransferredUsd += amountUsd;
+  console.log(`[TEE] Daily transferred total (in-memory): $${dailyTransferredUsd.toFixed(2)} / $${DAILY_LIMIT_USD}`);
 }
 
 function getClientIp(req: express.Request): string {
@@ -775,7 +880,7 @@ app.post("/transfer-usdc", authMiddleware, async (req, res) => {
   try {
     // Rate limiting check
     const clientIp = getClientIp(req);
-    const rateCheck = checkRateLimit(clientIp);
+    const rateCheck = await checkRateLimit(clientIp);
     if (!rateCheck.allowed) {
       console.warn(`[TEE] Rate limit exceeded for IP: ${clientIp}`);
       return res.status(429).json({
@@ -783,9 +888,6 @@ app.post("/transfer-usdc", authMiddleware, async (req, res) => {
         retryAfter: rateCheck.retryAfter,
       });
     }
-
-    // Daily aggregate limit check
-    resetDailyLimitIfNeeded();
 
     const { recipient, amountUsd, memo } = req.body as {
       recipient?: string;
@@ -812,13 +914,14 @@ app.post("/transfer-usdc", authMiddleware, async (req, res) => {
     }
 
     // Check daily aggregate limit
-    if (dailyTransferredUsd + amountUsd > DAILY_LIMIT_USD) {
+    const currentDailyTotal = await getDailyTransferred();
+    if (currentDailyTotal + amountUsd > DAILY_LIMIT_USD) {
       console.warn(
-        `[TEE] Daily limit would be exceeded: current=$${dailyTransferredUsd}, requested=$${amountUsd}, limit=$${DAILY_LIMIT_USD}`,
+        `[TEE] Daily limit would be exceeded: current=$${currentDailyTotal}, requested=$${amountUsd}, limit=$${DAILY_LIMIT_USD}`,
       );
       return res.status(400).json({
-        error: `Daily transfer limit would be exceeded. Limit: $${DAILY_LIMIT_USD}, Used: $${dailyTransferredUsd.toFixed(2)}, Requested: $${amountUsd}`,
-        dailyUsed: dailyTransferredUsd,
+        error: `Daily transfer limit would be exceeded. Limit: $${DAILY_LIMIT_USD}, Used: $${currentDailyTotal.toFixed(2)}, Requested: $${amountUsd}`,
+        dailyUsed: currentDailyTotal,
         dailyLimit: DAILY_LIMIT_USD,
       });
     }
@@ -905,10 +1008,7 @@ app.post("/transfer-usdc", authMiddleware, async (req, res) => {
     console.log(`[TEE] USDC transfer completed: ${sig}`);
 
     // Update daily aggregate after successful transfer
-    dailyTransferredUsd += amountUsd;
-    console.log(
-      `[TEE] Daily transferred total: $${dailyTransferredUsd.toFixed(2)} / $${DAILY_LIMIT_USD}`,
-    );
+    await addDailyTransferred(amountUsd);
 
     res.json({
       success: true,

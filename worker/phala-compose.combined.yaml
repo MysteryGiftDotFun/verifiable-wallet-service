@@ -1,4 +1,17 @@
 services:
+  # Redis for persistent rate limits and daily transfer caps
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    restart: always
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
   # Production service (mainnet)
   wallet-prod:
     image: phantasybot/verifiable-wallet-service:v0.1.0-SECURITY
@@ -15,9 +28,13 @@ services:
       - ALCHEMY_RPC_URL=${ALCHEMY_RPC_URL:-}
       - SOLANA_RPC_URL=${SOLANA_RPC_URL:-https://api.mainnet-beta.solana.com}
       - WALLET_LABELS_PATH=/app/data/wallet-labels.json
+      - REDIS_URL=redis://redis:6379
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - wallet-data-prod:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
     restart: always
     healthcheck:
       test: ['CMD', 'curl', '-f', 'http://localhost:3000/health']
@@ -42,9 +59,13 @@ services:
       - ALCHEMY_RPC_URL=${ALCHEMY_RPC_URL:-}
       - SOLANA_RPC_URL=https://api.devnet.solana.com
       - WALLET_LABELS_PATH=/app/data/wallet-labels.json
+      - REDIS_URL=redis://redis:6379
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - wallet-data-dev:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
     restart: always
     healthcheck:
       test: ['CMD', 'curl', '-f', 'http://localhost:3001/health']
@@ -56,3 +77,4 @@ services:
 volumes:
   wallet-data-prod:
   wallet-data-dev:
+  redis-data:
