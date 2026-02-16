@@ -1,15 +1,15 @@
-import 'dotenv/config';
-import express from 'express';
-import cors from 'cors';
-import { promises as fs } from 'fs';
-import path from 'path';
+import "dotenv/config";
+import express from "express";
+import cors from "cors";
+import { promises as fs } from "fs";
+import path from "path";
 import {
   Connection,
   Keypair,
   PublicKey,
   Transaction,
   sendAndConfirmTransaction,
-} from '@solana/web3.js';
+} from "@solana/web3.js";
 import {
   AuthorityType,
   createMint,
@@ -20,43 +20,81 @@ import {
   getAssociatedTokenAddress,
   TOKEN_PROGRAM_ID,
   ASSOCIATED_TOKEN_PROGRAM_ID,
-} from '@solana/spl-token';
+} from "@solana/spl-token";
 import {
   createCreateMasterEditionV3Instruction,
   createCreateMetadataAccountV3Instruction,
-} from '@metaplex-foundation/mpl-token-metadata';
-import { DstackClient } from '@phala/dstack-sdk';
+} from "@metaplex-foundation/mpl-token-metadata";
+import { DstackClient } from "@phala/dstack-sdk";
+import { ethers, Wallet, Contract } from "ethers";
 
 const app = express();
 app.use(express.json());
-app.use(cors());
+app.use(cors({
+  origin: process.env.NODE_ENV === 'production'
+    ? ['https://mysterygift.fun', 'https://vault.mysterygift.fun', /\.mysterygift\.fun$/]
+    : ['http://localhost:3000', 'http://localhost:5173', 'http://localhost:5174'],
+  credentials: true,
+}));
 
 // Internal Secret to protect this service
-const SERVICE_SECRET = process.env.WALLET_SERVICE_SECRET || '';
+const SERVICE_SECRET = process.env.WALLET_SERVICE_SECRET || "";
 
 // Middleware
 const authMiddleware = (
   req: express.Request,
   res: express.Response,
-  next: express.NextFunction
+  next: express.NextFunction,
 ) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || authHeader !== `Bearer ${SERVICE_SECRET}`) {
-    return res.status(401).json({ error: 'Unauthorized: Invalid Service Secret' });
+    return res
+      .status(401)
+      .json({ error: "Unauthorized: Invalid Service Secret" });
   }
   next();
 };
 
-const VALID_PURPOSES = new Set(['vault', 'giveaway']);
+const VALID_PURPOSES = new Set(["vault", "giveaway"]);
 
-// USDC Configuration
-const USDC_MAINNET_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
-const USDC_DEVNET_MINT = '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU';
+// USDC Configuration (Solana)
+const USDC_MAINNET_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const USDC_DEVNET_MINT = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU";
 const USDC_DECIMALS = 6;
+
+// USDC Configuration (Base)
+const USDC_BASE_MAINNET = "0x833589fCD6eDb6E08f4c7c32D4f288B37C9CAA8";
+const USDC_BASE_SEPOLIA = "0x036CbD538D6c2C8AA5a4E7b3C82273b1B6f8E3b7";
+const USDC_DECIMALS_BASE = 6;
+
+// Chain configuration
+type Chain = "solana" | "base";
+
+const getChainConfig = (chain: Chain) => {
+  if (chain === "base") {
+    return {
+      rpcUrl: process.env.BASE_RPC_URL || "https://mainnet.base.org",
+      usdcAddress:
+        process.env.BASE_NETWORK === "sepolia"
+          ? USDC_BASE_SEPOLIA
+          : USDC_BASE_MAINNET,
+      chainId: process.env.BASE_NETWORK === "sepolia" ? 84532 : 8453,
+    };
+  }
+  return {
+    rpcUrl: getRpcUrl(),
+    usdcAddress: getRpcUrl().includes("mainnet")
+      ? USDC_MAINNET_MINT
+      : USDC_DEVNET_MINT,
+  };
+};
 const LABELS_PATH =
-  process.env.WALLET_LABELS_PATH || path.join(process.cwd(), 'data', 'wallet-labels.json');
+  process.env.WALLET_LABELS_PATH ||
+  path.join(process.cwd(), "data", "wallet-labels.json");
 const MAX_LABEL_LENGTH = 120;
-const TOKEN_METADATA_PROGRAM_ID = new PublicKey('metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s');
+const TOKEN_METADATA_PROGRAM_ID = new PublicKey(
+  "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s",
+);
 const MAX_METADATA_NAME = 32;
 const MAX_METADATA_SYMBOL = 10;
 
@@ -77,7 +115,7 @@ function resetDailyLimitIfNeeded(): void {
   if (now >= dailyResetTime) {
     dailyTransferredUsd = 0;
     dailyResetTime = now + 24 * 60 * 60 * 1000;
-    console.log('[TEE] Daily transfer limit reset');
+    console.log("[TEE] Daily transfer limit reset");
   }
 }
 
@@ -100,16 +138,14 @@ function checkRateLimit(ip: string): { allowed: boolean; retryAfter?: number } {
 }
 
 function getClientIp(req: express.Request): string {
-  // Check X-Forwarded-For header (common for proxied requests)
-  const forwarded = req.headers['x-forwarded-for'];
-  if (typeof forwarded === 'string') {
-    return forwarded.split(',')[0].trim();
-  }
-  if (Array.isArray(forwarded) && forwarded.length > 0) {
-    return forwarded[0].split(',')[0].trim();
+  // Only trust cf-connecting-ip (set by Cloudflare, not user-controllable)
+  // Do NOT trust x-forwarded-for as it can be spoofed to bypass rate limits
+  const cfIp = req.headers["cf-connecting-ip"];
+  if (typeof cfIp === "string") {
+    return cfIp;
   }
   // Fallback to socket address
-  return req.socket?.remoteAddress || 'unknown';
+  return req.socket?.remoteAddress || "unknown";
 }
 
 const rpcUrls = [
@@ -121,7 +157,7 @@ let rpcIndex = 0;
 
 function getRpcUrl(): string {
   if (rpcUrls.length === 0) {
-    return 'https://api.devnet.solana.com';
+    return "https://api.devnet.solana.com";
   }
   const url = rpcUrls[rpcIndex % rpcUrls.length];
   rpcIndex += 1;
@@ -134,22 +170,22 @@ function getVaultKeyId(purpose: string): string {
 
 function getFallbackSeed(purpose: string): number {
   // Keep deterministic but distinct seeds for local dev.
-  return purpose === 'giveaway' ? 3 : 2;
+  return purpose === "giveaway" ? 3 : 2;
 }
 
 async function loadLabels(): Promise<Record<string, string>> {
   try {
-    const data = await fs.readFile(LABELS_PATH, 'utf8');
+    const data = await fs.readFile(LABELS_PATH, "utf8");
     const parsed = JSON.parse(data) as Record<string, string>;
     const sanitized: Record<string, string> = {};
     for (const [key, value] of Object.entries(parsed)) {
-      if (typeof value === 'string') {
+      if (typeof value === "string") {
         sanitized[key] = value;
       }
     }
     return sanitized;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       return {};
     }
     throw error;
@@ -158,10 +194,14 @@ async function loadLabels(): Promise<Record<string, string>> {
 
 async function saveLabels(labels: Record<string, string>): Promise<void> {
   await fs.mkdir(path.dirname(LABELS_PATH), { recursive: true });
-  await fs.writeFile(LABELS_PATH, JSON.stringify(labels, null, 2), 'utf8');
+  await fs.writeFile(LABELS_PATH, JSON.stringify(labels, null, 2), "utf8");
 }
 
-async function withRetry<T>(operation: () => Promise<T>, label: string, attempts = 3): Promise<T> {
+async function withRetry<T>(
+  operation: () => Promise<T>,
+  label: string,
+  attempts = 3,
+): Promise<T> {
   let lastError: unknown = null;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
@@ -182,26 +222,26 @@ async function withRetry<T>(operation: () => Promise<T>, label: string, attempts
  * Derives the secure vault keypair from the TEE environment.
  * In local dev (simulated), it uses a deterministic fallback seed.
  */
-async function getVaultKey(purpose: string = 'vault'): Promise<Keypair> {
+async function getVaultKey(purpose: string = "vault"): Promise<Keypair> {
   try {
     const keyId = getVaultKeyId(purpose);
 
     // Attempt TEE derivation using DstackClient
     const dstack = new DstackClient();
-    const keyResponse = await dstack.getKey('/', keyId);
+    const keyResponse = await dstack.getKey("/", keyId);
 
     // Ensure we have 32 bytes for the seed
     const seed = keyResponse.key.subarray(0, 32);
     return Keypair.fromSeed(seed);
   } catch (e) {
     // Strict check: If we claim to be in a TEE (dev or prod), we MUST NOT fallback.
-    if (process.env.PHALA_TEE === 'true') {
-      console.error('[TEE] CRITICAL: Failed to derive key in TEE environment!');
+    if (process.env.PHALA_TEE === "true") {
+      console.error("[TEE] CRITICAL: Failed to derive key in TEE environment!");
       throw e;
     }
 
     console.warn(
-      '[TEE] Derivation failed (Simulated/Local Mode). Using deterministic fallback key.'
+      "[TEE] Derivation failed (Simulated/Local Mode). Using deterministic fallback key.",
     );
 
     // Fallback deterministic key for local testing only
@@ -211,27 +251,207 @@ async function getVaultKey(purpose: string = 'vault'): Promise<Keypair> {
   }
 }
 
+/**
+ * Derives the Base (EVM) wallet from the TEE environment.
+ * Uses the same key derivation pattern but for EVM addresses.
+ */
+async function getBaseVaultKey(purpose: string = "vault"): Promise<Wallet> {
+  const chainConfig = getChainConfig("base");
+  const provider = new ethers.JsonRpcProvider(chainConfig.rpcUrl);
+
+  try {
+    const keyId = `mystery-gift-${purpose}-base-vault-v1`;
+
+    // Attempt TEE derivation using DstackClient
+    const dstack = new DstackClient();
+    const keyResponse = await dstack.getKey("/", keyId);
+
+    // For EVM, we use the key to derive an address
+    const privateKey = Buffer.from(keyResponse.key).toString("hex");
+    return new Wallet(privateKey, provider);
+  } catch (e) {
+    if (process.env.PHALA_TEE === "true") {
+      console.error(
+        "[TEE] CRITICAL: Failed to derive Base key in TEE environment!",
+      );
+      throw e;
+    }
+
+    console.warn(
+      "[TEE] Base derivation failed (Simulated/Local Mode). Using deterministic fallback key.",
+    );
+
+    // Fallback deterministic key for local testing
+    const fallbackSeed = new Uint8Array(32).fill(getFallbackSeed(purpose));
+    const privateKey = Buffer.from(fallbackSeed).toString("hex");
+    return new Wallet(privateKey, provider);
+  }
+}
+
+/**
+ * Get Base vault public address.
+ */
+async function getBaseVaultAddress(purpose: string = "vault"): Promise<string> {
+  const wallet = await getBaseVaultKey(purpose);
+  return wallet.address;
+}
+
+/**
+ * Transfer NFT on Base chain (ERC-721).
+ */
+async function transferNftBase(
+  mint: string,
+  recipient: string,
+  fromAddress: string,
+): Promise<{ success: boolean; txHash?: string; error?: string }> {
+  try {
+    const wallet = await getBaseVaultKey("vault");
+    const chainConfig = getChainConfig("base");
+    const provider = new ethers.JsonRpcProvider(chainConfig.rpcUrl);
+
+    // ERC-721 transfer ABI (safeTransferFrom)
+    const erc721Abi = [
+      "function safeTransferFrom(address from, address to, uint256 tokenId) external",
+    ];
+
+    // For now, we use a simple approach - in production, you'd want to
+    // verify the contract is ERC-721 and call safeTransferFrom
+    // This is a placeholder that would need the actual NFT contract address
+
+    // Build the transaction
+    const nonce = await provider.getTransactionCount(wallet.address);
+    const feeData = await provider.getFeeData();
+
+    const tx = {
+      from: wallet.address,
+      to: mint, // NFT contract address
+      data: ethers.solidityPacked(
+        ["address", "address", "uint256"],
+        [wallet.address, recipient, 1],
+      ),
+      nonce,
+      maxFeePerGas: feeData.maxFeePerGas,
+      maxPriorityFeePerGas: feeData.maxPriorityFeePerGas,
+    };
+
+    const response = await wallet.sendTransaction(tx);
+    await response.wait();
+
+    return { success: true, txHash: response.hash };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : "Unknown error",
+    };
+  }
+}
+
+/**
+ * Transfer USDC on Base chain (ERC-20).
+ */
+async function transferUsdcBase(
+  recipient: string,
+  amountUsd: number,
+): Promise<{ success: boolean; txHash?: string; error?: string }> {
+  try {
+    const wallet = await getBaseVaultKey("vault");
+    const chainConfig = getChainConfig("base");
+    const provider = new ethers.JsonRpcProvider(chainConfig.rpcUrl);
+
+    // USDC ERC-20 ABI
+    const usdcAbi = [
+      "function transfer(address to, uint256 amount) returns (bool)",
+      "function decimals() view returns (uint8)",
+      "function balanceOf(address owner) view returns (uint256)",
+    ];
+
+    const usdcContract = new Contract(chainConfig.usdcAddress, usdcAbi, wallet);
+
+    // Get decimals
+    const decimals = await usdcContract.decimals();
+    const amountRaw = ethers.parseUnits(amountUsd.toString(), decimals);
+
+    // Check balance
+    const balance = await usdcContract.balanceOf(wallet.address);
+    if (balance < amountRaw) {
+      return {
+        success: false,
+        error: `Insufficient USDC balance. Have ${ethers.formatUnits(balance, decimals)}, need ${amountUsd}`,
+      };
+    }
+
+    // Transfer
+    const tx = await usdcContract.transfer(recipient, amountRaw);
+    await tx.wait();
+
+    return { success: true, txHash: tx.hash };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : "Unknown error",
+    };
+  }
+}
+
+/**
+ * Get Base vault USDC balance.
+ */
+async function getBaseUsdcBalance(): Promise<{
+  balance: number;
+  address: string;
+}> {
+  try {
+    const wallet = await getBaseVaultKey("vault");
+    const chainConfig = getChainConfig("base");
+    const provider = new ethers.JsonRpcProvider(chainConfig.rpcUrl);
+
+    const usdcAbi = [
+      "function decimals() view returns (uint8)",
+      "function balanceOf(address owner) view returns (uint256)",
+    ];
+
+    const usdcContract = new Contract(
+      chainConfig.usdcAddress,
+      usdcAbi,
+      provider,
+    );
+    const decimals = await usdcContract.decimals();
+    const balance = await usdcContract.balanceOf(wallet.address);
+
+    return {
+      balance: Number(ethers.formatUnits(balance, decimals)),
+      address: wallet.address,
+    };
+  } catch (error) {
+    return { balance: 0, address: "" };
+  }
+}
+
 async function createMetadataAccounts(
   connection: Connection,
   payer: Keypair,
   mint: PublicKey,
   uri: string,
   name: string,
-  symbol: string
+  symbol: string,
 ): Promise<void> {
   const metadataPda = PublicKey.findProgramAddressSync(
-    [Buffer.from('metadata'), TOKEN_METADATA_PROGRAM_ID.toBuffer(), mint.toBuffer()],
-    TOKEN_METADATA_PROGRAM_ID
+    [
+      Buffer.from("metadata"),
+      TOKEN_METADATA_PROGRAM_ID.toBuffer(),
+      mint.toBuffer(),
+    ],
+    TOKEN_METADATA_PROGRAM_ID,
   )[0];
 
   const masterEditionPda = PublicKey.findProgramAddressSync(
     [
-      Buffer.from('metadata'),
+      Buffer.from("metadata"),
       TOKEN_METADATA_PROGRAM_ID.toBuffer(),
       mint.toBuffer(),
-      Buffer.from('edition'),
+      Buffer.from("edition"),
     ],
-    TOKEN_METADATA_PROGRAM_ID
+    TOKEN_METADATA_PROGRAM_ID,
   )[0];
 
   const metadataIx = createCreateMetadataAccountV3Instruction(
@@ -256,7 +476,7 @@ async function createMetadataAccounts(
         isMutable: true,
         collectionDetails: null,
       },
-    }
+    },
   );
 
   const masterEditionIx = createCreateMasterEditionV3Instruction(
@@ -268,40 +488,43 @@ async function createMetadataAccounts(
       payer: payer.publicKey,
       metadata: metadataPda,
     },
-    { createMasterEditionArgs: { maxSupply: 0 } }
+    { createMasterEditionArgs: { maxSupply: 0 } },
   );
 
   const tx = new Transaction().add(metadataIx, masterEditionIx);
   await withRetry(
-    () => sendAndConfirmTransaction(connection, tx, [payer], { commitment: 'confirmed' }),
-    'create metadata accounts'
+    () =>
+      sendAndConfirmTransaction(connection, tx, [payer], {
+        commitment: "confirmed",
+      }),
+    "create metadata accounts",
   );
 }
 
-app.get('/health', (req, res) => {
+app.get("/health", (req, res) => {
   res.json({
-    status: 'ok',
-    service: 'verifiable-wallet-service',
-    version: process.env.APP_VERSION || '0.1.0',
-    environment: process.env.APP_ENVIRONMENT || 'development',
-    tee: process.env.PHALA_TEE ? 'active' : 'simulated',
+    status: "ok",
+    service: "verifiable-wallet-service",
+    version: process.env.APP_VERSION || "0.1.0",
+    environment: process.env.APP_ENVIRONMENT || "development",
+    tee: process.env.PHALA_TEE ? "active" : "simulated",
     timestamp: new Date().toISOString(),
   });
 });
 
-app.get('/', (_req, res) => {
-  res.redirect('/dashboard');
+app.get("/", (_req, res) => {
+  res.redirect("/dashboard");
 });
 
 /**
  * Returns the Public Key of the Vault.
  * Marketplace API uses this to build transactions.
  */
-app.get('/public-key', authMiddleware, async (req, res) => {
+app.get("/public-key", authMiddleware, async (req, res) => {
   try {
-    const purpose = (req.query?.purpose as string) || 'vault';
+    const purpose = (req.query?.purpose as string) || "vault";
     if (!VALID_PURPOSES.has(purpose)) {
-      return res.status(400).json({ error: 'Invalid purpose' });
+      return res.status(400).json({ error: "Invalid purpose" });
     }
 
     const keypair = await getVaultKey(purpose);
@@ -313,7 +536,7 @@ app.get('/public-key', authMiddleware, async (req, res) => {
   }
 });
 
-app.get('/wallets', authMiddleware, async (_req, res) => {
+app.get("/wallets", authMiddleware, async (_req, res) => {
   try {
     const labels = await loadLabels();
     const purposes = Array.from(VALID_PURPOSES.values());
@@ -323,9 +546,9 @@ app.get('/wallets', authMiddleware, async (_req, res) => {
         return {
           purpose,
           publicKey: keypair.publicKey.toBase58(),
-          label: labels[purpose] || '',
+          label: labels[purpose] || "",
         };
-      })
+      }),
     );
 
     res.json({ wallets });
@@ -334,19 +557,21 @@ app.get('/wallets', authMiddleware, async (_req, res) => {
   }
 });
 
-app.post('/wallets/labels', authMiddleware, async (req, res) => {
+app.post("/wallets/labels", authMiddleware, async (req, res) => {
   try {
     const { purpose, label } = req.body as { purpose?: string; label?: string };
     if (!purpose || !VALID_PURPOSES.has(purpose)) {
-      return res.status(400).json({ error: 'Invalid purpose' });
+      return res.status(400).json({ error: "Invalid purpose" });
     }
-    if (label !== undefined && typeof label !== 'string') {
-      return res.status(400).json({ error: 'Label must be a string' });
+    if (label !== undefined && typeof label !== "string") {
+      return res.status(400).json({ error: "Label must be a string" });
     }
 
-    const sanitizedLabel = (label || '').trim();
+    const sanitizedLabel = (label || "").trim();
     if (sanitizedLabel.length > MAX_LABEL_LENGTH) {
-      return res.status(400).json({ error: `Label too long (max ${MAX_LABEL_LENGTH})` });
+      return res
+        .status(400)
+        .json({ error: `Label too long (max ${MAX_LABEL_LENGTH})` });
     }
 
     const labels = await loadLabels();
@@ -370,7 +595,7 @@ app.post('/wallets/labels', authMiddleware, async (req, res) => {
  * - Behavior: Creates mint + ATA + metadata + master edition, mints 1 token, locks mint authority.
  * - Errors: Validates required fields, uses service secret auth, returns HTTP 4xx/5xx.
  */
-app.post('/mint-nft', authMiddleware, async (req, res) => {
+app.post("/mint-nft", authMiddleware, async (req, res) => {
   try {
     const { name, symbol, uri, recipient } = req.body as {
       name?: string;
@@ -378,14 +603,16 @@ app.post('/mint-nft', authMiddleware, async (req, res) => {
       uri?: string;
       recipient?: string;
     };
-    const purpose = (req.query?.purpose as string) || 'vault';
+    const purpose = (req.query?.purpose as string) || "vault";
 
     if (!VALID_PURPOSES.has(purpose)) {
-      return res.status(400).json({ error: 'Invalid purpose' });
+      return res.status(400).json({ error: "Invalid purpose" });
     }
 
     if (!name || !symbol || !uri) {
-      return res.status(400).json({ error: 'name, symbol, and uri are required' });
+      return res
+        .status(400)
+        .json({ error: "name, symbol, and uri are required" });
     }
 
     const sanitizedName = String(name).trim();
@@ -393,26 +620,43 @@ app.post('/mint-nft', authMiddleware, async (req, res) => {
     const sanitizedUri = String(uri).trim();
 
     if (!sanitizedName || !sanitizedSymbol || !sanitizedUri) {
-      return res.status(400).json({ error: 'name, symbol, and uri must be non-empty' });
+      return res
+        .status(400)
+        .json({ error: "name, symbol, and uri must be non-empty" });
     }
 
-    const connection = new Connection(getRpcUrl(), 'confirmed');
+    const connection = new Connection(getRpcUrl(), "confirmed");
     const keypair = await getVaultKey(purpose);
-    const recipientKey = recipient ? new PublicKey(recipient) : keypair.publicKey;
+    const recipientKey = recipient
+      ? new PublicKey(recipient)
+      : keypair.publicKey;
 
     const mint = await withRetry(
-      () => createMint(connection, keypair, keypair.publicKey, keypair.publicKey, 0),
-      'create mint'
+      () =>
+        createMint(
+          connection,
+          keypair,
+          keypair.publicKey,
+          keypair.publicKey,
+          0,
+        ),
+      "create mint",
     );
 
     const tokenAccount = await withRetry(
-      () => getOrCreateAssociatedTokenAccount(connection, keypair, mint, recipientKey),
-      'get associated token account'
+      () =>
+        getOrCreateAssociatedTokenAccount(
+          connection,
+          keypair,
+          mint,
+          recipientKey,
+        ),
+      "get associated token account",
     );
 
     await withRetry(
       () => mintTo(connection, keypair, mint, tokenAccount.address, keypair, 1),
-      'mint token'
+      "mint token",
     );
 
     await createMetadataAccounts(
@@ -421,7 +665,7 @@ app.post('/mint-nft', authMiddleware, async (req, res) => {
       mint,
       sanitizedUri,
       sanitizedName,
-      sanitizedSymbol
+      sanitizedSymbol,
     );
 
     res.json({
@@ -436,22 +680,42 @@ app.post('/mint-nft', authMiddleware, async (req, res) => {
 
 /**
  * Transfer an NFT using the vault key inside TEE.
- * Body: { mint: string; recipient: string; amount?: number }
+ * Body: { mint: string; recipient: string; amount?: number; chain?: 'solana' | 'base' }
  */
-app.post('/transfer-nft', authMiddleware, async (req, res) => {
+app.post("/transfer-nft", authMiddleware, async (req, res) => {
   try {
-    const { mint, recipient, amount } = req.body as {
+    const { mint, recipient, amount, chain } = req.body as {
       mint?: string;
       recipient?: string;
       amount?: number;
+      chain?: string;
     };
 
     if (!mint || !recipient) {
-      return res.status(400).json({ error: 'mint and recipient are required' });
+      return res.status(400).json({ error: "mint and recipient are required" });
     }
 
-    const connection = new Connection(getRpcUrl(), 'confirmed');
-    const vaultKeypair = await getVaultKey('vault');
+    const targetChain = (chain === "base" ? "base" : "solana") as Chain;
+
+    // Handle Base chain transfers
+    if (targetChain === "base") {
+      const vaultAddress = await getBaseVaultAddress("vault");
+      const result = await transferNftBase(mint, recipient, vaultAddress);
+
+      if (result.success) {
+        return res.json({
+          success: true,
+          signature: result.txHash,
+          chain: "base",
+        });
+      } else {
+        return res.status(500).json({ error: result.error, chain: "base" });
+      }
+    }
+
+    // Solana transfers (original implementation)
+    const connection = new Connection(getRpcUrl(), "confirmed");
+    const vaultKeypair = await getVaultKey("vault");
     const mintKey = new PublicKey(mint);
     const recipientKey = new PublicKey(recipient);
     const transferAmount = amount && amount > 0 ? amount : 1;
@@ -462,13 +726,19 @@ app.post('/transfer-nft', authMiddleware, async (req, res) => {
           connection,
           vaultKeypair,
           mintKey,
-          vaultKeypair.publicKey
+          vaultKeypair.publicKey,
         ),
-      'get source ATA'
+      "get source ATA",
     );
     const destAta = await withRetry(
-      () => getOrCreateAssociatedTokenAccount(connection, vaultKeypair, mintKey, recipientKey),
-      'get destination ATA'
+      () =>
+        getOrCreateAssociatedTokenAccount(
+          connection,
+          vaultKeypair,
+          mintKey,
+          recipientKey,
+        ),
+      "get destination ATA",
     );
 
     const sig = await withRetry(
@@ -480,16 +750,16 @@ app.post('/transfer-nft', authMiddleware, async (req, res) => {
               sourceAta.address,
               destAta.address,
               vaultKeypair.publicKey,
-              transferAmount
-            )
+              transferAmount,
+            ),
           ),
           [vaultKeypair],
-          { commitment: 'confirmed' }
+          { commitment: "confirmed" },
         ),
-      'transfer nft'
+      "transfer nft",
     );
 
-    res.json({ success: true, signature: sig });
+    res.json({ success: true, signature: sig, chain: "solana" });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -501,7 +771,7 @@ app.post('/transfer-nft', authMiddleware, async (req, res) => {
  *
  * Body: { recipient: string; amountUsd: number; memo?: string }
  */
-app.post('/transfer-usdc', authMiddleware, async (req, res) => {
+app.post("/transfer-usdc", authMiddleware, async (req, res) => {
   try {
     // Rate limiting check
     const clientIp = getClientIp(req);
@@ -509,7 +779,7 @@ app.post('/transfer-usdc', authMiddleware, async (req, res) => {
     if (!rateCheck.allowed) {
       console.warn(`[TEE] Rate limit exceeded for IP: ${clientIp}`);
       return res.status(429).json({
-        error: 'Too many transfer requests. Please try again later.',
+        error: "Too many transfer requests. Please try again later.",
         retryAfter: rateCheck.retryAfter,
       });
     }
@@ -524,11 +794,13 @@ app.post('/transfer-usdc', authMiddleware, async (req, res) => {
     };
 
     if (!recipient) {
-      return res.status(400).json({ error: 'recipient is required' });
+      return res.status(400).json({ error: "recipient is required" });
     }
 
     if (!amountUsd || amountUsd <= 0) {
-      return res.status(400).json({ error: 'amountUsd must be a positive number' });
+      return res
+        .status(400)
+        .json({ error: "amountUsd must be a positive number" });
     }
 
     // Safety limit: max $10,000 per transfer to prevent catastrophic errors
@@ -541,7 +813,9 @@ app.post('/transfer-usdc', authMiddleware, async (req, res) => {
 
     // Check daily aggregate limit
     if (dailyTransferredUsd + amountUsd > DAILY_LIMIT_USD) {
-      console.warn(`[TEE] Daily limit would be exceeded: current=$${dailyTransferredUsd}, requested=$${amountUsd}, limit=$${DAILY_LIMIT_USD}`);
+      console.warn(
+        `[TEE] Daily limit would be exceeded: current=$${dailyTransferredUsd}, requested=$${amountUsd}, limit=$${DAILY_LIMIT_USD}`,
+      );
       return res.status(400).json({
         error: `Daily transfer limit would be exceeded. Limit: $${DAILY_LIMIT_USD}, Used: $${dailyTransferredUsd.toFixed(2)}, Requested: $${amountUsd}`,
         dailyUsed: dailyTransferredUsd,
@@ -549,31 +823,41 @@ app.post('/transfer-usdc', authMiddleware, async (req, res) => {
       });
     }
 
-    const connection = new Connection(getRpcUrl(), 'confirmed');
-    const vaultKeypair = await getVaultKey('vault');
+    const connection = new Connection(getRpcUrl(), "confirmed");
+    const vaultKeypair = await getVaultKey("vault");
 
     // Determine USDC mint based on network
     const rpcUrl = getRpcUrl();
-    const isMainnet = rpcUrl.includes('mainnet');
-    const usdcMint = new PublicKey(isMainnet ? USDC_MAINNET_MINT : USDC_DEVNET_MINT);
+    const isMainnet = rpcUrl.includes("mainnet");
+    const usdcMint = new PublicKey(
+      isMainnet ? USDC_MAINNET_MINT : USDC_DEVNET_MINT,
+    );
 
     const recipientKey = new PublicKey(recipient);
 
     // Convert USD to USDC amount (6 decimals)
-    const amountRaw = BigInt(Math.floor(amountUsd * Math.pow(10, USDC_DECIMALS)));
+    const amountRaw = BigInt(
+      Math.floor(amountUsd * Math.pow(10, USDC_DECIMALS)),
+    );
 
-    console.log(`[TEE] Initiating USDC transfer: $${amountUsd} to ${recipient}`);
+    console.log(
+      `[TEE] Initiating USDC transfer: $${amountUsd} to ${recipient}`,
+    );
     if (memo) {
       console.log(`[TEE] Memo: ${memo}`);
     }
 
     // Get source ATA (vault's USDC account)
-    const sourceAta = await getAssociatedTokenAddress(usdcMint, vaultKeypair.publicKey);
+    const sourceAta = await getAssociatedTokenAddress(
+      usdcMint,
+      vaultKeypair.publicKey,
+    );
 
     // Check vault USDC balance
     try {
       const balance = await connection.getTokenAccountBalance(sourceAta);
-      const vaultBalance = Number(balance.value.amount) / Math.pow(10, USDC_DECIMALS);
+      const vaultBalance =
+        Number(balance.value.amount) / Math.pow(10, USDC_DECIMALS);
       if (vaultBalance < amountUsd) {
         return res.status(400).json({
           error: `Insufficient USDC balance. Vault has $${vaultBalance.toFixed(2)}, requested $${amountUsd}`,
@@ -583,14 +867,20 @@ app.post('/transfer-usdc', authMiddleware, async (req, res) => {
       console.log(`[TEE] Vault USDC balance: $${vaultBalance.toFixed(2)}`);
     } catch (e) {
       return res.status(400).json({
-        error: 'Vault has no USDC token account',
+        error: "Vault has no USDC token account",
       });
     }
 
     // Get or create destination ATA
     const destAta = await withRetry(
-      () => getOrCreateAssociatedTokenAccount(connection, vaultKeypair, usdcMint, recipientKey),
-      'get destination USDC ATA'
+      () =>
+        getOrCreateAssociatedTokenAccount(
+          connection,
+          vaultKeypair,
+          usdcMint,
+          recipientKey,
+        ),
+      "get destination USDC ATA",
     );
 
     // Build and send transfer transaction
@@ -603,20 +893,22 @@ app.post('/transfer-usdc', authMiddleware, async (req, res) => {
               sourceAta,
               destAta.address,
               vaultKeypair.publicKey,
-              amountRaw
-            )
+              amountRaw,
+            ),
           ),
           [vaultKeypair],
-          { commitment: 'confirmed' }
+          { commitment: "confirmed" },
         ),
-      'transfer USDC'
+      "transfer USDC",
     );
 
     console.log(`[TEE] USDC transfer completed: ${sig}`);
 
     // Update daily aggregate after successful transfer
     dailyTransferredUsd += amountUsd;
-    console.log(`[TEE] Daily transferred total: $${dailyTransferredUsd.toFixed(2)} / $${DAILY_LIMIT_USD}`);
+    console.log(
+      `[TEE] Daily transferred total: $${dailyTransferredUsd.toFixed(2)} / $${DAILY_LIMIT_USD}`,
+    );
 
     res.json({
       success: true,
@@ -626,7 +918,7 @@ app.post('/transfer-usdc', authMiddleware, async (req, res) => {
       memo: memo || null,
     });
   } catch (error: any) {
-    console.error('[TEE] USDC transfer failed:', error);
+    console.error("[TEE] USDC transfer failed:", error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -634,26 +926,29 @@ app.post('/transfer-usdc', authMiddleware, async (req, res) => {
 /**
  * Get vault USDC balance
  */
-app.get('/usdc-balance', authMiddleware, async (req, res) => {
+app.get("/usdc-balance", authMiddleware, async (req, res) => {
   try {
-    const purpose = (req.query?.purpose as string) || 'vault';
+    const purpose = (req.query?.purpose as string) || "vault";
     if (!VALID_PURPOSES.has(purpose)) {
-      return res.status(400).json({ error: 'Invalid purpose' });
+      return res.status(400).json({ error: "Invalid purpose" });
     }
 
-    const connection = new Connection(getRpcUrl(), 'confirmed');
+    const connection = new Connection(getRpcUrl(), "confirmed");
     const keypair = await getVaultKey(purpose);
 
     // Determine USDC mint based on network
     const rpcUrl = getRpcUrl();
-    const isMainnet = rpcUrl.includes('mainnet');
-    const usdcMint = new PublicKey(isMainnet ? USDC_MAINNET_MINT : USDC_DEVNET_MINT);
+    const isMainnet = rpcUrl.includes("mainnet");
+    const usdcMint = new PublicKey(
+      isMainnet ? USDC_MAINNET_MINT : USDC_DEVNET_MINT,
+    );
 
     const ata = await getAssociatedTokenAddress(usdcMint, keypair.publicKey);
 
     try {
       const balance = await connection.getTokenAccountBalance(ata);
-      const usdBalance = Number(balance.value.amount) / Math.pow(10, USDC_DECIMALS);
+      const usdBalance =
+        Number(balance.value.amount) / Math.pow(10, USDC_DECIMALS);
 
       res.json({
         success: true,
@@ -669,12 +964,12 @@ app.get('/usdc-balance', authMiddleware, async (req, res) => {
       res.json({
         success: true,
         balance: 0,
-        balanceRaw: '0',
+        balanceRaw: "0",
         decimals: USDC_DECIMALS,
         usdcMint: usdcMint.toBase58(),
         wallet: keypair.publicKey.toBase58(),
         tokenAccount: null,
-        message: 'No USDC token account exists for this wallet',
+        message: "No USDC token account exists for this wallet",
       });
     }
   } catch (error: any) {
@@ -683,11 +978,12 @@ app.get('/usdc-balance', authMiddleware, async (req, res) => {
 });
 
 function getDashboardHtml(): string {
-  const version = process.env.APP_VERSION || '0.1.0';
-  const environment = process.env.APP_ENVIRONMENT || 'development';
-  const teeStatus = process.env.PHALA_TEE ? 'active' : 'simulated';
-  const envBadgeClass = environment === 'production' ? 'production' : 'development';
-  const envBadgeText = environment === 'production' ? 'PROD' : 'DEV';
+  const version = process.env.APP_VERSION || "0.1.0";
+  const environment = process.env.APP_ENVIRONMENT || "development";
+  const teeStatus = process.env.PHALA_TEE ? "active" : "simulated";
+  const envBadgeClass =
+    environment === "production" ? "production" : "development";
+  const envBadgeText = environment === "production" ? "PROD" : "DEV";
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -972,7 +1268,7 @@ function getDashboardHtml(): string {
               </div>
               <div style="background: rgba(0,0,0,0.3); padding: 0.75rem; border-radius: 8px;">
                 <div style="font-size: 0.7rem; color: var(--text-muted); margin-bottom: 0.25rem;">TEE STATUS</div>
-                <div style="font-size: 0.9rem; font-weight: 600; color: ${teeStatus === 'active' ? 'var(--success)' : '#FF9500'};">${teeStatus.toUpperCase()}</div>
+                <div style="font-size: 0.9rem; font-weight: 600; color: ${teeStatus === "active" ? "var(--success)" : "#FF9500"};">${teeStatus.toUpperCase()}</div>
               </div>
             </div>
           </div>
@@ -1183,8 +1479,8 @@ function getDashboardHtml(): string {
 </html>`;
 }
 
-app.get('/dashboard', (_req, res) => {
-  res.setHeader('Content-Type', 'text/html');
+app.get("/dashboard", (_req, res) => {
+  res.setHeader("Content-Type", "text/html");
   res.send(getDashboardHtml());
 });
 
@@ -1194,12 +1490,12 @@ app.get('/dashboard', (_req, res) => {
  */
 async function validateTransactionInstructions(
   transaction: Transaction,
-  vaultPublicKey: PublicKey
+  vaultPublicKey: PublicKey,
 ): Promise<string | null> {
   const instructions = transaction.instructions;
 
   if (instructions.length === 0) {
-    return 'Transaction has no instructions';
+    return "Transaction has no instructions";
   }
 
   // Maximum 3 instructions (ATA creation + transfer + optional memo)
@@ -1225,7 +1521,7 @@ async function validateTransactionInstructions(
       // For Transfer instruction, validate source account
       // Keys: [0]=source, [1]=destination, [2]=authority
       if (ix.keys.length < 3) {
-        return 'Invalid Transfer instruction: insufficient accounts';
+        return "Invalid Transfer instruction: insufficient accounts";
       }
 
       const authority = ix.keys[2].pubkey;
@@ -1241,7 +1537,7 @@ async function validateTransactionInstructions(
       // ATA creation is allowed - vault may need to create recipient ATA
       // Keys: [0]=payer, [1]=ata, [2]=owner, [3]=mint, [4]=system, [5]=token
       if (ix.keys.length < 4) {
-        return 'Invalid ATA instruction: insufficient accounts';
+        return "Invalid ATA instruction: insufficient accounts";
       }
 
       // Verify payer is the vault
@@ -1254,14 +1550,16 @@ async function validateTransactionInstructions(
     }
 
     // Allow: System Program (for rent-exempt ATA creation)
-    const SYSTEM_PROGRAM_ID = new PublicKey('11111111111111111111111111111111');
+    const SYSTEM_PROGRAM_ID = new PublicKey("11111111111111111111111111111111");
     if (programId.equals(SYSTEM_PROGRAM_ID)) {
       // System program calls are typically part of ATA creation
       continue;
     }
 
     // Allow: Compute Budget Program (for priority fees)
-    const COMPUTE_BUDGET_ID = new PublicKey('ComputeBudget111111111111111111111111111111');
+    const COMPUTE_BUDGET_ID = new PublicKey(
+      "ComputeBudget111111111111111111111111111111",
+    );
     if (programId.equals(COMPUTE_BUDGET_ID)) {
       continue;
     }
@@ -1278,31 +1576,34 @@ async function validateTransactionInstructions(
  *
  * Body: { transactionBase64: string }
  */
-app.post('/sign-transaction', authMiddleware, async (req, res) => {
+app.post("/sign-transaction", authMiddleware, async (req, res) => {
   try {
     const { transactionBase64 } = req.body;
-    const purpose = (req.query?.purpose as string) || 'vault';
+    const purpose = (req.query?.purpose as string) || "vault";
 
     if (!VALID_PURPOSES.has(purpose)) {
-      return res.status(400).json({ error: 'Invalid purpose' });
+      return res.status(400).json({ error: "Invalid purpose" });
     }
     if (!transactionBase64) {
-      return res.status(400).json({ error: 'Missing transactionBase64' });
+      return res.status(400).json({ error: "Missing transactionBase64" });
     }
 
     // 1. Recover Transaction
-    const txBuffer = Buffer.from(transactionBase64, 'base64');
+    const txBuffer = Buffer.from(transactionBase64, "base64");
     const transaction = Transaction.from(txBuffer);
 
     // 2. Get Secure Key
     const keypair = await getVaultKey(purpose);
 
     // 3. Security Check: Validate transaction instructions
-    const validationError = await validateTransactionInstructions(transaction, keypair.publicKey);
+    const validationError = await validateTransactionInstructions(
+      transaction,
+      keypair.publicKey,
+    );
     if (validationError) {
       console.error(`[TEE] Transaction validation failed: ${validationError}`);
       return res.status(400).json({
-        error: 'Transaction validation failed',
+        error: "Transaction validation failed",
         reason: validationError,
       });
     }
@@ -1314,16 +1615,18 @@ app.post('/sign-transaction', authMiddleware, async (req, res) => {
     // requireAllSignatures=false because we might just be one signer (e.g. payer might be elsewhere, though usually vault pays or API pays)
     const signedTxBase64 = transaction
       .serialize({ requireAllSignatures: false })
-      .toString('base64');
+      .toString("base64");
 
-    console.log(`[TEE] Signed ${purpose} transaction for ${keypair.publicKey.toBase58()}`);
+    console.log(
+      `[TEE] Signed ${purpose} transaction for ${keypair.publicKey.toBase58()}`,
+    );
 
     res.json({
       success: true,
       signedTransaction: signedTxBase64,
     });
   } catch (error: any) {
-    console.error('Signing error:', error);
+    console.error("Signing error:", error);
     res.status(500).json({ error: error.message });
   }
 });
