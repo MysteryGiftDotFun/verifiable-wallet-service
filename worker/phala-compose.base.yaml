@@ -1,0 +1,56 @@
+services:
+  # Mainnet Base vault (port 3000)
+  vault-base-prod:
+    image: phantasybot/verifiable-wallet-service:v0.0.1-BETA
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - NODE_ENV=production
+      - APP_VERSION=0.0.1-BETA
+      - APP_ENVIRONMENT=production
+      - WALLET_SERVICE_SECRET=${WALLET_SERVICE_SECRET:-}
+      - PHALA_TEE=${PHALA_TEE:-true}
+      - BASE_RPC_URL=${BASE_RPC_URL:-https://mainnet.base.org}
+      - BASE_NETWORK=${BASE_NETWORK:-mainnet}
+      - WALLET_LABELS_PATH=/app/data/wallet-labels.json
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - wallet-data-base-prod:/app/data
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Devnet Base vault (port 3001)
+  vault-base-dev:
+    image: phantasybot/verifiable-wallet-service:v0.0.1-BETA
+    ports:
+      - "3001:3001"
+    environment:
+      - PORT=3001
+      - NODE_ENV=development
+      - APP_VERSION=0.0.1-BETA
+      - APP_ENVIRONMENT=development
+      - WALLET_SERVICE_SECRET=${WALLET_SERVICE_SECRET_DEV:-dev-secret}
+      - PHALA_TEE=${PHALA_TEE:-true}
+      - BASE_RPC_URL=${BASE_RPC_URL:-https://sepolia.base.dev}
+      - BASE_NETWORK=${BASE_NETWORK:-sepolia}
+      - WALLET_LABELS_PATH=/app/data/wallet-labels.json
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - wallet-data-base-dev:/app/data
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  wallet-data-base-prod:
+  wallet-data-base-dev:

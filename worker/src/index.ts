@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import crypto from "crypto";
 import { promises as fs } from "fs";
 import path from "path";
 import Redis from "ioredis";
@@ -31,24 +32,57 @@ import { ethers, Wallet, Contract } from "ethers";
 
 const app = express();
 app.use(express.json());
-app.use(cors({
-  origin: process.env.NODE_ENV === 'production'
-    ? ['https://mysterygift.fun', 'https://vault.mysterygift.fun', /\.mysterygift\.fun$/]
-    : ['http://localhost:3000', 'http://localhost:5173', 'http://localhost:5174'],
-  credentials: true,
-}));
+app.use(
+  cors({
+    origin:
+      process.env.NODE_ENV === "production"
+        ? [
+            "https://mysterygift.fun",
+            "https://vault.mysterygift.fun",
+            /\.mysterygift\.fun$/,
+          ]
+        : [
+            "http://localhost:3000",
+            "http://localhost:5173",
+            "http://localhost:5174",
+          ],
+    credentials: true,
+  }),
+);
 
 // Internal Secret to protect this service
-const SERVICE_SECRET = process.env.WALLET_SERVICE_SECRET || "";
+const SERVICE_SECRET = process.env.WALLET_SERVICE_SECRET;
+if (!SERVICE_SECRET || SERVICE_SECRET.length === 0) {
+  throw new Error(
+    "CRITICAL: WALLET_SERVICE_SECRET environment variable must be set and non-empty",
+  );
+}
 
-// Middleware
+// Middleware - uses timing-safe comparison to prevent timing attacks
 const authMiddleware = (
   req: express.Request,
   res: express.Response,
   next: express.NextFunction,
 ) => {
   const authHeader = req.headers.authorization;
-  if (!authHeader || authHeader !== `Bearer ${SERVICE_SECRET}`) {
+  const expected = `Bearer ${SERVICE_SECRET}`;
+
+  if (!authHeader) {
+    return res
+      .status(401)
+      .json({ error: "Unauthorized: Missing authorization header" });
+  }
+
+  try {
+    const isValid =
+      authHeader.length === expected.length &&
+      crypto.timingSafeEqual(Buffer.from(authHeader), Buffer.from(expected));
+    if (!isValid) {
+      return res
+        .status(401)
+        .json({ error: "Unauthorized: Invalid Service Secret" });
+    }
+  } catch {
     return res
       .status(401)
       .json({ error: "Unauthorized: Invalid Service Secret" });
@@ -57,6 +91,15 @@ const authMiddleware = (
 };
 
 const VALID_PURPOSES = new Set(["vault", "giveaway"]);
+
+const IS_PRODUCTION = process.env.APP_ENVIRONMENT === "production";
+
+function sanitizeError(error: unknown): string {
+  if (!IS_PRODUCTION) {
+    return error instanceof Error ? error.message : String(error);
+  }
+  return "An internal error occurred. Check server logs for details.";
+}
 
 // USDC Configuration (Solana)
 const USDC_MAINNET_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -112,7 +155,9 @@ let redisAvailable = false;
 function initRedis(): void {
   const redisUrl = process.env.REDIS_URL;
   if (!redisUrl) {
-    console.warn("[TEE] REDIS_URL not set, using in-memory rate limits (resets on restart)");
+    console.warn(
+      "[TEE] REDIS_URL not set, using in-memory rate limits (resets on restart)",
+    );
     return;
   }
 
@@ -127,12 +172,17 @@ function initRedis(): void {
 
   redis.on("connect", () => {
     redisAvailable = true;
-    console.log("[TEE] Redis connected — rate limits and daily caps are persistent");
+    console.log(
+      "[TEE] Redis connected — rate limits and daily caps are persistent",
+    );
   });
 
   redis.on("error", (err) => {
     if (redisAvailable) {
-      console.error("[TEE] Redis error, falling back to in-memory:", err.message);
+      console.error(
+        "[TEE] Redis error, falling back to in-memory:",
+        err.message,
+      );
     }
     redisAvailable = false;
   });
@@ -143,7 +193,10 @@ function initRedis(): void {
   });
 
   redis.connect().catch((err) => {
-    console.warn("[TEE] Redis initial connection failed, using in-memory:", err.message);
+    console.warn(
+      "[TEE] Redis initial connection failed, using in-memory:",
+      err.message,
+    );
   });
 }
 
@@ -172,7 +225,9 @@ function secondsUntilMidnightUtc(): number {
   return Math.ceil((midnight.getTime() - now.getTime()) / 1000);
 }
 
-async function checkRateLimit(ip: string): Promise<{ allowed: boolean; retryAfter?: number }> {
+async function checkRateLimit(
+  ip: string,
+): Promise<{ allowed: boolean; retryAfter?: number }> {
   if (redisAvailable && redis) {
     try {
       const key = `ratelimit:${ip}`;
@@ -183,7 +238,10 @@ async function checkRateLimit(ip: string): Promise<{ allowed: boolean; retryAfte
       }
       if (count > RATE_LIMIT_MAX_REQUESTS) {
         const ttl = await redis.ttl(key);
-        return { allowed: false, retryAfter: ttl > 0 ? ttl : RATE_LIMIT_WINDOW_SECS };
+        return {
+          allowed: false,
+          retryAfter: ttl > 0 ? ttl : RATE_LIMIT_WINDOW_SECS,
+        };
       }
       return { allowed: true };
     } catch {
@@ -232,14 +290,18 @@ async function addDailyTransferred(amountUsd: number): Promise<void> {
       if (ttl < 0) {
         await redis.expire(key, secondsUntilMidnightUtc());
       }
-      console.log(`[TEE] Daily transferred total (Redis): $${parseFloat(String(newVal)).toFixed(2)} / $${DAILY_LIMIT_USD}`);
+      console.log(
+        `[TEE] Daily transferred total (Redis): $${parseFloat(String(newVal)).toFixed(2)} / $${DAILY_LIMIT_USD}`,
+      );
       return;
     } catch {
       // Fall through to in-memory
     }
   }
   dailyTransferredUsd += amountUsd;
-  console.log(`[TEE] Daily transferred total (in-memory): $${dailyTransferredUsd.toFixed(2)} / $${DAILY_LIMIT_USD}`);
+  console.log(
+    `[TEE] Daily transferred total (in-memory): $${dailyTransferredUsd.toFixed(2)} / $${DAILY_LIMIT_USD}`,
+  );
 }
 
 function getClientIp(req: express.Request): string {
@@ -606,13 +668,30 @@ async function createMetadataAccounts(
   );
 }
 
-app.get("/health", (req, res) => {
-  res.json({
-    status: "ok",
+app.get("/health", async (req, res) => {
+  let dbHealthy = false;
+  try {
+    if (redis) {
+      await redis.ping();
+      dbHealthy = true;
+    }
+  } catch {
+    // Redis unreachable
+  }
+
+  const checks = {
+    redis: dbHealthy || !redis, // OK if Redis not configured
+  };
+
+  const isHealthy = Object.values(checks).every(Boolean);
+
+  res.status(isHealthy ? 200 : 503).json({
+    status: isHealthy ? "ok" : "degraded",
     service: "verifiable-wallet-service",
     version: process.env.APP_VERSION || "0.1.0",
     environment: process.env.APP_ENVIRONMENT || "development",
     tee: process.env.PHALA_TEE ? "active" : "simulated",
+    checks,
     timestamp: new Date().toISOString(),
   });
 });
@@ -637,7 +716,8 @@ app.get("/public-key", authMiddleware, async (req, res) => {
       publicKey: keypair.publicKey.toBase58(),
     });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    console.error("[Wallet Service] Error:", error);
+    res.status(500).json({ error: sanitizeError(error) });
   }
 });
 
@@ -658,7 +738,8 @@ app.get("/wallets", authMiddleware, async (_req, res) => {
 
     res.json({ wallets });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    console.error("[Wallet Service] Error:", error);
+    res.status(500).json({ error: sanitizeError(error) });
   }
 });
 
@@ -689,7 +770,8 @@ app.post("/wallets/labels", authMiddleware, async (req, res) => {
     await saveLabels(labels);
     res.json({ success: true, labels });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    console.error("[Wallet Service] Error:", error);
+    res.status(500).json({ error: sanitizeError(error) });
   }
 });
 
@@ -779,7 +861,8 @@ app.post("/mint-nft", authMiddleware, async (req, res) => {
       recipient: recipientKey.toBase58(),
     });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    console.error("[Wallet Service] Error:", error);
+    res.status(500).json({ error: sanitizeError(error) });
   }
 });
 
@@ -866,7 +949,8 @@ app.post("/transfer-nft", authMiddleware, async (req, res) => {
 
     res.json({ success: true, signature: sig, chain: "solana" });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    console.error("[Wallet Service] Error:", error);
+    res.status(500).json({ error: sanitizeError(error) });
   }
 });
 
@@ -1073,7 +1157,8 @@ app.get("/usdc-balance", authMiddleware, async (req, res) => {
       });
     }
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    console.error("[Wallet Service] Error:", error);
+    res.status(500).json({ error: sanitizeError(error) });
   }
 });
 
@@ -1416,6 +1501,9 @@ function getDashboardHtml(): string {
       </div>
 
       <div class="legal-footer">
+        <div style="margin-bottom:0.5rem; padding:0.5rem; background:rgba(255,149,0,0.1); border-radius:6px; font-size:0.7rem;">
+          <strong style="color:#FF9500;">BETA SOFTWARE</strong> — Use at your own risk. This is experimental software.
+        </div>
         &copy; 2026 MYSTERY GIFT &bull; <a href="https://mysterygift.fun/terms">Terms</a> &bull; <a href="https://mysterygift.fun/privacy">Privacy</a> &bull; <a href="https://x.com/mysterygift_fun" target="_blank">X</a>
       </div>
     </div>
@@ -1732,6 +1820,34 @@ app.post("/sign-transaction", authMiddleware, async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`[TEE] Verifiable Wallet Service running on port ${PORT}`);
+});
+
+process.on("SIGTERM", async () => {
+  console.log("[TEE] Received SIGTERM, shutting down gracefully...");
+  server.close(() => {
+    console.log("[TEE] HTTP server closed");
+    process.exit(0);
+  });
+  setTimeout(() => {
+    console.error("[TEE] Forced shutdown after timeout");
+    process.exit(1);
+  }, 10000);
+});
+
+process.on("SIGINT", async () => {
+  console.log("[TEE] Received SIGINT, shutting down gracefully...");
+  server.close(() => {
+    console.log("[TEE] HTTP server closed");
+    process.exit(0);
+  });
+  setTimeout(() => {
+    console.error("[TEE] Forced shutdown after timeout");
+    process.exit(1);
+  }, 10000);
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("[TEE] Unhandled Rejection at:", promise, "reason:", reason);
 });
