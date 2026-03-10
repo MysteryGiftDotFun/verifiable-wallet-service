@@ -4,12 +4,16 @@ import cors from "cors";
 import crypto from "crypto";
 import { promises as fs } from "fs";
 import path from "path";
-import Redis from "ioredis";
 import {
+  AddressLookupTableAccount,
   Connection,
   Keypair,
+  MessageV0,
   PublicKey,
   Transaction,
+  TransactionInstruction,
+  TransactionMessage,
+  VersionedTransaction,
   sendAndConfirmTransaction,
 } from "@solana/web3.js";
 import {
@@ -20,6 +24,7 @@ import {
   setAuthority,
   createTransferInstruction,
   getAssociatedTokenAddress,
+  getAssociatedTokenAddressSync,
   TOKEN_PROGRAM_ID,
   ASSOCIATED_TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
@@ -139,8 +144,56 @@ const MAX_LABEL_LENGTH = 120;
 const TOKEN_METADATA_PROGRAM_ID = new PublicKey(
   "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s",
 );
+const SYSTEM_PROGRAM_ID = new PublicKey("11111111111111111111111111111111");
+const COMPUTE_BUDGET_ID = new PublicKey(
+  "ComputeBudget111111111111111111111111111111",
+);
+const MEMO_PROGRAM_ID = new PublicKey(
+  "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr",
+);
+const MAGIC_EDEN_V1_PROGRAM_ID = new PublicKey(
+  "MEisE1HzehtrDpAAT8PnLHjpSSkRYakotTuJRPjTpo8",
+);
+const MAGIC_EDEN_M2_PROGRAM_ID = new PublicKey(
+  "M2mx93ekt1Cs5xqrq5RXgqfBTMNC2TqDGA3LNi5aF7K",
+);
+const METAPLEX_AUCTION_HOUSE_PROGRAM_ID = new PublicKey(
+  "hausS13jsjafwWwGqZTUQRmWyvyxn9EQpqMwV1PBBmk",
+);
+const MAX_ALLOWED_MARKETPLACE_INSTRUCTIONS = 12;
+const MARKETPLACE_FEE_BUFFER_LAMPORTS = 10_000_000; // 0.01 SOL
 const MAX_METADATA_NAME = 32;
 const MAX_METADATA_SYMBOL = 10;
+
+type TransactionValidationContext =
+  | {
+      type?: "vault_transfer";
+      expectedRecipient?: string;
+      expectedMint?: string;
+    }
+  | {
+      type: "magiceden_buy_now";
+      expectedBuyer?: string;
+      expectedSeller: string;
+      expectedMint: string;
+      maxLamports: number;
+    };
+
+type DecodedTransaction =
+  | {
+      kind: "legacy";
+      payer: PublicKey;
+      recentBlockhash: string;
+      instructions: TransactionInstruction[];
+      transaction: Transaction;
+    }
+  | {
+      kind: "versioned";
+      payer: PublicKey;
+      recentBlockhash: string;
+      instructions: TransactionInstruction[];
+      transaction: VersionedTransaction;
+    };
 
 // Rate limiting configuration
 const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
@@ -149,7 +202,42 @@ const RATE_LIMIT_MAX_REQUESTS = 10; // Max 10 USDC transfers per hour per IP
 const DAILY_LIMIT_USD = 50000; // $50,000 daily aggregate limit
 
 // Redis client for persistent rate limits
-let redis: Redis | null = null;
+function loadRedisConstructor(): any {
+  try {
+    const mod = require("ioredis");
+    return mod.default || mod;
+  } catch (initialError) {
+    const fsSync = require("fs") as typeof import("fs");
+    let currentDir = process.cwd();
+
+    while (true) {
+      const pnpmDir = path.join(currentDir, "node_modules", ".pnpm");
+      if (fsSync.existsSync(pnpmDir)) {
+        const match = fsSync
+          .readdirSync(pnpmDir)
+          .find((entry) => entry.startsWith("ioredis@"));
+        if (match) {
+          const mod = require(path.join(
+            pnpmDir,
+            match,
+            "node_modules",
+            "ioredis",
+          ));
+          return mod.default || mod;
+        }
+      }
+
+      const parentDir = path.dirname(currentDir);
+      if (parentDir === currentDir) {
+        throw initialError;
+      }
+      currentDir = parentDir;
+    }
+  }
+}
+
+const Redis = loadRedisConstructor();
+let redis: any = null;
 let redisAvailable = false;
 
 function initRedis(): void {
@@ -163,7 +251,7 @@ function initRedis(): void {
 
   redis = new Redis(redisUrl, {
     maxRetriesPerRequest: 3,
-    retryStrategy(times) {
+    retryStrategy(times: number) {
       if (times > 10) return null;
       return Math.min(times * 200, 5000);
     },
@@ -177,11 +265,11 @@ function initRedis(): void {
     );
   });
 
-  redis.on("error", (err) => {
+  redis.on("error", (err: unknown) => {
     if (redisAvailable) {
       console.error(
         "[TEE] Redis error, falling back to in-memory:",
-        err.message,
+        err instanceof Error ? err.message : String(err),
       );
     }
     redisAvailable = false;
@@ -192,10 +280,10 @@ function initRedis(): void {
     console.warn("[TEE] Redis connection closed, falling back to in-memory");
   });
 
-  redis.connect().catch((err) => {
+  redis.connect().catch((err: unknown) => {
     console.warn(
       "[TEE] Redis initial connection failed, using in-memory:",
-      err.message,
+      err instanceof Error ? err.message : String(err),
     );
   });
 }
@@ -1672,91 +1760,400 @@ app.get("/dashboard", (_req, res) => {
   res.send(getDashboardHtml());
 });
 
-/**
- * Validate that a transaction only contains allowed instructions.
- * Returns null if valid, or an error message if invalid.
- */
-async function validateTransactionInstructions(
-  transaction: Transaction,
-  vaultPublicKey: PublicKey,
-): Promise<string | null> {
-  const instructions = transaction.instructions;
-
-  if (instructions.length === 0) {
-    return "Transaction has no instructions";
+async function loadAddressLookupTableAccounts(
+  message: MessageV0,
+): Promise<AddressLookupTableAccount[]> {
+  if (message.addressTableLookups.length === 0) {
+    return [];
   }
 
-  // Maximum 3 instructions (ATA creation + transfer + optional memo)
+  const connection = new Connection(getRpcUrl(), "confirmed");
+  const tables = await Promise.all(
+    message.addressTableLookups.map(async (lookup) => {
+      const tableAccount = await connection.getAddressLookupTable(
+        lookup.accountKey,
+      );
+      if (!tableAccount.value) {
+        throw new Error(
+          `Missing address lookup table: ${lookup.accountKey.toBase58()}`,
+        );
+      }
+      return tableAccount.value;
+    }),
+  );
+
+  return tables;
+}
+
+async function decodeTransaction(
+  txBuffer: Buffer,
+): Promise<DecodedTransaction> {
+  try {
+    const transaction = Transaction.from(txBuffer);
+    if (!transaction.feePayer) {
+      throw new Error("Transaction fee payer is missing");
+    }
+    if (!transaction.recentBlockhash) {
+      throw new Error("Transaction recent blockhash is missing");
+    }
+
+    return {
+      kind: "legacy",
+      payer: transaction.feePayer,
+      recentBlockhash: transaction.recentBlockhash,
+      instructions: transaction.instructions,
+      transaction,
+    };
+  } catch (legacyError) {
+    try {
+      const transaction = VersionedTransaction.deserialize(
+        new Uint8Array(txBuffer),
+      );
+      const message = transaction.message as MessageV0;
+      const lookupTables =
+        message.version === 0
+          ? await loadAddressLookupTableAccounts(message)
+          : [];
+      const decompiled = TransactionMessage.decompile(
+        transaction.message,
+        lookupTables.length > 0
+          ? { addressLookupTableAccounts: lookupTables }
+          : undefined,
+      );
+
+      return {
+        kind: "versioned",
+        payer: decompiled.payerKey,
+        recentBlockhash: decompiled.recentBlockhash,
+        instructions: decompiled.instructions,
+        transaction,
+      };
+    } catch (versionedError) {
+      throw new Error(
+        `Unsupported Solana transaction payload: ${
+          versionedError instanceof Error
+            ? versionedError.message
+            : String(versionedError)
+        }`,
+      );
+    }
+  }
+}
+
+function getMagicEdenAllowedProgramIds(): Set<string> {
+  const configured = (process.env.MAGICEDEN_ALLOWED_PROGRAM_IDS || "")
+    .split(",")
+    .map((programId) => programId.trim())
+    .filter(Boolean);
+
+  if (configured.length > 0) {
+    return new Set(configured);
+  }
+
+  return new Set([
+    SYSTEM_PROGRAM_ID.toBase58(),
+    TOKEN_PROGRAM_ID.toBase58(),
+    ASSOCIATED_TOKEN_PROGRAM_ID.toBase58(),
+    COMPUTE_BUDGET_ID.toBase58(),
+    MEMO_PROGRAM_ID.toBase58(),
+    TOKEN_METADATA_PROGRAM_ID.toBase58(),
+    MAGIC_EDEN_V1_PROGRAM_ID.toBase58(),
+    MAGIC_EDEN_M2_PROGRAM_ID.toBase58(),
+    METAPLEX_AUCTION_HOUSE_PROGRAM_ID.toBase58(),
+  ]);
+}
+
+async function validateVaultTransferInstructions(
+  instructions: TransactionInstruction[],
+  vaultPublicKey: PublicKey,
+  context: Extract<TransactionValidationContext, { type?: "vault_transfer" }>,
+): Promise<string | null> {
   if (instructions.length > 3) {
     return `Too many instructions: ${instructions.length} (max 3)`;
   }
 
-  for (let i = 0; i < instructions.length; i++) {
-    const ix = instructions[i];
+  let expectedSourceAta: PublicKey | null = null;
+  let expectedDestinationAta: PublicKey | null = null;
+  let expectedMintKey: PublicKey | null = null;
+  let expectedRecipientKey: PublicKey | null = null;
+
+  if (context.expectedMint && context.expectedRecipient) {
+    expectedMintKey = new PublicKey(context.expectedMint);
+    expectedRecipientKey = new PublicKey(context.expectedRecipient);
+    expectedSourceAta = getAssociatedTokenAddressSync(
+      expectedMintKey,
+      vaultPublicKey,
+    );
+    expectedDestinationAta = getAssociatedTokenAddressSync(
+      expectedMintKey,
+      expectedRecipientKey,
+    );
+  }
+
+  for (const ix of instructions) {
     const programId = ix.programId;
 
-    // Allow: Token Program (for transfers)
     if (programId.equals(TOKEN_PROGRAM_ID)) {
-      // Decode instruction type - first byte indicates instruction type
       const instructionType = ix.data[0];
-
-      // Token Program instruction types:
-      // 3 = Transfer, 12 = TransferChecked
       if (instructionType !== 3 && instructionType !== 12) {
         return `Invalid Token instruction type: ${instructionType}. Only Transfer (3) or TransferChecked (12) allowed`;
       }
 
-      // For Transfer instruction, validate source account
-      // Keys: [0]=source, [1]=destination, [2]=authority
-      if (ix.keys.length < 3) {
+      const authorityIndex = instructionType === 12 ? 3 : 2;
+      if (ix.keys.length <= authorityIndex) {
         return "Invalid Transfer instruction: insufficient accounts";
       }
 
-      const authority = ix.keys[2].pubkey;
+      const authority = ix.keys[authorityIndex].pubkey;
       if (!authority.equals(vaultPublicKey)) {
         return `Invalid authority: ${authority.toBase58()}. Expected vault: ${vaultPublicKey.toBase58()}`;
+      }
+
+      if (expectedSourceAta && !ix.keys[0].pubkey.equals(expectedSourceAta)) {
+        return `Invalid source ATA: ${ix.keys[0].pubkey.toBase58()}`;
+      }
+
+      const destinationIndex = instructionType === 12 ? 2 : 1;
+      if (
+        expectedDestinationAta &&
+        !ix.keys[destinationIndex].pubkey.equals(expectedDestinationAta)
+      ) {
+        return `Invalid destination ATA: ${ix.keys[
+          destinationIndex
+        ].pubkey.toBase58()}`;
+      }
+
+      if (instructionType === 12 && expectedMintKey) {
+        if (!ix.keys[1].pubkey.equals(expectedMintKey)) {
+          return `Invalid mint: ${ix.keys[1].pubkey.toBase58()}`;
+        }
       }
 
       continue;
     }
 
-    // Allow: Associated Token Program (for ATA creation)
     if (programId.equals(ASSOCIATED_TOKEN_PROGRAM_ID)) {
-      // ATA creation is allowed - vault may need to create recipient ATA
-      // Keys: [0]=payer, [1]=ata, [2]=owner, [3]=mint, [4]=system, [5]=token
       if (ix.keys.length < 4) {
         return "Invalid ATA instruction: insufficient accounts";
       }
 
-      // Verify payer is the vault
       const payer = ix.keys[0].pubkey;
       if (!payer.equals(vaultPublicKey)) {
         return `Invalid ATA payer: ${payer.toBase58()}. Expected vault: ${vaultPublicKey.toBase58()}`;
       }
 
+      if (expectedDestinationAta && !ix.keys[1].pubkey.equals(expectedDestinationAta)) {
+        return `Invalid ATA address: ${ix.keys[1].pubkey.toBase58()}`;
+      }
+
+      if (expectedRecipientKey && !ix.keys[2].pubkey.equals(expectedRecipientKey)) {
+        return `Invalid ATA owner: ${ix.keys[2].pubkey.toBase58()}`;
+      }
+
+      if (expectedMintKey && !ix.keys[3].pubkey.equals(expectedMintKey)) {
+        return `Invalid ATA mint: ${ix.keys[3].pubkey.toBase58()}`;
+      }
+
       continue;
     }
 
-    // Allow: System Program (for rent-exempt ATA creation)
-    const SYSTEM_PROGRAM_ID = new PublicKey("11111111111111111111111111111111");
-    if (programId.equals(SYSTEM_PROGRAM_ID)) {
-      // System program calls are typically part of ATA creation
+    if (
+      programId.equals(SYSTEM_PROGRAM_ID) ||
+      programId.equals(COMPUTE_BUDGET_ID)
+    ) {
       continue;
     }
 
-    // Allow: Compute Budget Program (for priority fees)
-    const COMPUTE_BUDGET_ID = new PublicKey(
-      "ComputeBudget111111111111111111111111111111",
-    );
-    if (programId.equals(COMPUTE_BUDGET_ID)) {
-      continue;
-    }
-
-    // Reject any other program
     return `Unauthorized program: ${programId.toBase58()}`;
   }
 
-  return null; // Valid
+  return null;
+}
+
+function validateMagicEdenBuyInstructions(
+  decoded: DecodedTransaction,
+  vaultPublicKey: PublicKey,
+  context: Extract<TransactionValidationContext, { type: "magiceden_buy_now" }>,
+): string | null {
+  const { instructions, payer } = decoded;
+
+  if (instructions.length > MAX_ALLOWED_MARKETPLACE_INSTRUCTIONS) {
+    return `Too many marketplace instructions: ${instructions.length} (max ${MAX_ALLOWED_MARKETPLACE_INSTRUCTIONS})`;
+  }
+
+  const expectedBuyer = new PublicKey(
+    context.expectedBuyer || vaultPublicKey.toBase58(),
+  );
+  const expectedSeller = new PublicKey(context.expectedSeller);
+  const expectedMint = new PublicKey(context.expectedMint);
+
+  if (!payer.equals(expectedBuyer) || !payer.equals(vaultPublicKey)) {
+    return `Invalid buyer/fee payer: ${payer.toBase58()}`;
+  }
+
+  const allowedPrograms = getMagicEdenAllowedProgramIds();
+  const marketplacePrograms = new Set([
+    MAGIC_EDEN_V1_PROGRAM_ID.toBase58(),
+    MAGIC_EDEN_M2_PROGRAM_ID.toBase58(),
+    METAPLEX_AUCTION_HOUSE_PROGRAM_ID.toBase58(),
+  ]);
+
+  let sawMarketplaceProgram = false;
+  let sawMint = false;
+  let sawSeller = false;
+
+  for (const ix of instructions) {
+    const programId = ix.programId.toBase58();
+    if (!allowedPrograms.has(programId)) {
+      return `Unauthorized marketplace program: ${programId}`;
+    }
+
+    if (marketplacePrograms.has(programId)) {
+      sawMarketplaceProgram = true;
+    }
+
+    for (const key of ix.keys) {
+      if (key.isSigner && !key.pubkey.equals(vaultPublicKey)) {
+        return `Unexpected signer requested: ${key.pubkey.toBase58()}`;
+      }
+
+      if (key.pubkey.equals(expectedMint)) {
+        sawMint = true;
+      }
+
+      if (key.pubkey.equals(expectedSeller)) {
+        sawSeller = true;
+      }
+    }
+  }
+
+  if (!sawMarketplaceProgram) {
+    return "Marketplace program missing from transaction";
+  }
+
+  if (!sawMint) {
+    return `Expected mint missing from transaction: ${expectedMint.toBase58()}`;
+  }
+
+  if (!sawSeller) {
+    return `Expected seller missing from transaction: ${expectedSeller.toBase58()}`;
+  }
+
+  if (!Number.isFinite(context.maxLamports) || context.maxLamports <= 0) {
+    return `Invalid maxLamports: ${context.maxLamports}`;
+  }
+
+  return null;
+}
+
+/**
+ * Validate that a transaction only contains allowed instructions.
+ * Returns null if valid, or an error message if invalid.
+ */
+async function validateTransactionInstructions(
+  decoded: DecodedTransaction,
+  vaultPublicKey: PublicKey,
+  context: TransactionValidationContext,
+): Promise<string | null> {
+  const instructions = decoded.instructions;
+
+  if (instructions.length === 0) {
+    return "Transaction has no instructions";
+  }
+
+  if (context.type === "magiceden_buy_now") {
+    return validateMagicEdenBuyInstructions(decoded, vaultPublicKey, context);
+  }
+
+  return validateVaultTransferInstructions(instructions, vaultPublicKey, context);
+}
+
+function signDecodedTransaction(
+  decoded: DecodedTransaction,
+  keypair: Keypair,
+): void {
+  if (decoded.kind === "legacy") {
+    decoded.transaction.partialSign(keypair);
+    return;
+  }
+
+  decoded.transaction.sign([keypair]);
+}
+
+function serializeSignedTransaction(decoded: DecodedTransaction): string {
+  if (decoded.kind === "legacy") {
+    return decoded.transaction
+      .serialize({ requireAllSignatures: false })
+      .toString("base64");
+  }
+
+  return Buffer.from(decoded.transaction.serialize()).toString("base64");
+}
+
+async function simulateMarketplaceSpend(
+  decoded: DecodedTransaction,
+  buyer: PublicKey,
+  seller: PublicKey,
+  maxLamports: number,
+): Promise<string | null> {
+  const connection = new Connection(getRpcUrl(), "confirmed");
+  const preAccounts = await connection.getMultipleAccountsInfo([buyer, seller], {
+    commitment: "confirmed",
+  });
+
+  if (!preAccounts[0]) {
+    return `Buyer account not found: ${buyer.toBase58()}`;
+  }
+
+  if (!preAccounts[1]) {
+    return `Seller account not found: ${seller.toBase58()}`;
+  }
+
+  const simulation =
+    decoded.kind === "legacy"
+      ? await connection.simulateTransaction(
+          decoded.transaction,
+          undefined,
+          [buyer, seller],
+        )
+      : await connection.simulateTransaction(decoded.transaction, {
+          commitment: "confirmed",
+          replaceRecentBlockhash: true,
+          sigVerify: false,
+          accounts: {
+            encoding: "base64",
+            addresses: [buyer.toBase58(), seller.toBase58()],
+          },
+        });
+
+  if (simulation.value.err) {
+    return `Marketplace transaction simulation failed: ${JSON.stringify(
+      simulation.value.err,
+    )}`;
+  }
+
+  const postBuyer = simulation.value.accounts?.[0];
+  const postSeller = simulation.value.accounts?.[1];
+  if (!postBuyer || !postSeller) {
+    return "Marketplace simulation did not return buyer/seller balances";
+  }
+
+  const buyerSpend = preAccounts[0].lamports - postBuyer.lamports;
+  const sellerCredit = postSeller.lamports - preAccounts[1].lamports;
+
+  if (buyerSpend <= 0) {
+    return "Marketplace simulation did not debit the buyer wallet";
+  }
+
+  if (sellerCredit <= 0) {
+    return "Marketplace simulation did not credit the seller wallet";
+  }
+
+  if (buyerSpend > maxLamports + MARKETPLACE_FEE_BUFFER_LAMPORTS) {
+    return `Marketplace spend ${buyerSpend} exceeds max ${maxLamports}`;
+  }
+
+  return null;
 }
 
 /**
@@ -1766,7 +2163,17 @@ async function validateTransactionInstructions(
  */
 app.post("/sign-transaction", authMiddleware, async (req, res) => {
   try {
-    const { transactionBase64 } = req.body;
+    const {
+      transactionBase64,
+      validationContext,
+      toAddress,
+      mint,
+    } = req.body as {
+      transactionBase64?: string;
+      validationContext?: TransactionValidationContext;
+      toAddress?: string;
+      mint?: string;
+    };
     const purpose = (req.query?.purpose as string) || "vault";
 
     if (!VALID_PURPOSES.has(purpose)) {
@@ -1778,15 +2185,20 @@ app.post("/sign-transaction", authMiddleware, async (req, res) => {
 
     // 1. Recover Transaction
     const txBuffer = Buffer.from(transactionBase64, "base64");
-    const transaction = Transaction.from(txBuffer);
+    const decoded = await decodeTransaction(txBuffer);
 
     // 2. Get Secure Key
     const keypair = await getVaultKey(purpose);
 
     // 3. Security Check: Validate transaction instructions
     const validationError = await validateTransactionInstructions(
-      transaction,
+      decoded,
       keypair.publicKey,
+      validationContext || {
+        type: "vault_transfer",
+        expectedRecipient: toAddress,
+        expectedMint: mint,
+      },
     );
     if (validationError) {
       console.error(`[TEE] Transaction validation failed: ${validationError}`);
@@ -1797,16 +2209,32 @@ app.post("/sign-transaction", authMiddleware, async (req, res) => {
     }
 
     // 4. Partial Sign
-    transaction.partialSign(keypair);
+    signDecodedTransaction(decoded, keypair);
+
+    if (validationContext?.type === "magiceden_buy_now") {
+      const postSignValidationError = await simulateMarketplaceSpend(
+        decoded,
+        keypair.publicKey,
+        new PublicKey(validationContext.expectedSeller),
+        validationContext.maxLamports,
+      );
+
+      if (postSignValidationError) {
+        console.error(
+          `[TEE] Marketplace post-sign validation failed: ${postSignValidationError}`,
+        );
+        return res.status(400).json({
+          error: "Marketplace transaction validation failed",
+          reason: postSignValidationError,
+        });
+      }
+    }
 
     // 5. Serialize and return
-    // requireAllSignatures=false because we might just be one signer (e.g. payer might be elsewhere, though usually vault pays or API pays)
-    const signedTxBase64 = transaction
-      .serialize({ requireAllSignatures: false })
-      .toString("base64");
+    const signedTxBase64 = serializeSignedTransaction(decoded);
 
     console.log(
-      `[TEE] Signed ${purpose} transaction for ${keypair.publicKey.toBase58()}`,
+      `[TEE] Signed ${purpose} ${decoded.kind} transaction for ${keypair.publicKey.toBase58()}`,
     );
 
     res.json({
