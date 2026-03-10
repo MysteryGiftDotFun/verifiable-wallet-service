@@ -1,17 +1,12 @@
 # Verifiable Wallet Service
 
-This service runs in a TEE (Trusted Execution Environment) on Phala Cloud to manage the Mystery Gift Vault and Giveaway wallets securely.
+This service provides the live Mystery Gift vault and signing runtime at `https://vault.mysterygift.fun`.
 
-## Version
+## Current Scope
 
-Current Version: **0.0.1-BETA**
+- Phala TEE-backed signing
+- Solana and Base wallet operations
+- internal transfer and marketplace validation helpers
+- bearer-token protected service-to-service API
 
-## Deployment
-
-Automated deployment via GitLab CI/CD is configured for:
-
-- `main` branch -> Production CVM
-- `development` branch -> Production CVM (Currently shared)
-
-See `DEPLOYMENT.md` for more details.
-Mon Jan 12 22:05:17 EST 2026
+See [DEPLOYMENT.md](DEPLOYMENT.md) for the current deployment contract.

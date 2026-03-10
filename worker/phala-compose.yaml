@@ -7,13 +7,17 @@ services:
       - PORT=3000
       - NODE_ENV=production
       - APP_ENVIRONMENT=${APP_ENVIRONMENT:-production}
-      - APP_VERSION=${APP_VERSION:-dev}
+      - APP_VERSION=${APP_VERSION:-0.1.0}
       - WALLET_SERVICE_SECRET=${WALLET_SERVICE_SECRET:?WALLET_SERVICE_SECRET is required}
-      - PHALA_TEE=${PHALA_TEE:-false}
+      - PHALA_TEE=${PHALA_TEE:-true}
       - HELIUS_RPC_URL=${HELIUS_RPC_URL:-}
       - ALCHEMY_RPC_URL=${ALCHEMY_RPC_URL:-}
-      - SOLANA_RPC_URL=${SOLANA_RPC_URL:-https://api.devnet.solana.com}
+      - SOLANA_RPC_URL=${SOLANA_RPC_URL:-https://api.mainnet-beta.solana.com}
+      - BASE_RPC_URL=${BASE_RPC_URL:-https://mainnet.base.org}
+      - BASE_NETWORK=${BASE_NETWORK:-mainnet}
       - WALLET_LABELS_PATH=/app/data/wallet-labels.json
+      - REDIS_URL=${REDIS_URL:-}
+      - MAGICEDEN_ALLOWED_PROGRAM_IDS=${MAGICEDEN_ALLOWED_PROGRAM_IDS:-}
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - /app/data
