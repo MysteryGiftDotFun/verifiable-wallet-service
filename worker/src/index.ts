@@ -116,8 +116,15 @@ const USDC_BASE_MAINNET = "0x833589fCD6eDb6E08f4c7c32D4f288B37C9CAA8";
 const USDC_BASE_SEPOLIA = "0x036CbD538D6c2C8AA5a4E7b3C82273b1B6f8E3b7";
 const USDC_DECIMALS_BASE = 6;
 
+// USDG on Robinhood Chain mainnet (Paxos Global Dollar — not USDC)
+const USDG_ROBINHOOD_MAINNET =
+  "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168";
+const USDG_DECIMALS = 6;
+const ROBINHOOD_CHAIN_ID_MAINNET = 4663;
+const ROBINHOOD_CHAIN_ID_TESTNET = 46630;
+
 // Chain configuration
-type Chain = "solana" | "base";
+type Chain = "solana" | "base" | "robinhood";
 
 const getChainConfig = (chain: Chain) => {
   if (chain === "base") {
@@ -128,6 +135,25 @@ const getChainConfig = (chain: Chain) => {
           ? USDC_BASE_SEPOLIA
           : USDC_BASE_MAINNET,
       chainId: process.env.BASE_NETWORK === "sepolia" ? 84532 : 8453,
+      stablecoinSymbol: "USDC" as const,
+    };
+  }
+  if (chain === "robinhood") {
+    const isTestnet =
+      process.env.ROBINHOOD_NETWORK === "testnet" ||
+      process.env.ROBINHOOD_NETWORK === "46630";
+    return {
+      rpcUrl:
+        process.env.ROBINHOOD_RPC_URL ||
+        (isTestnet
+          ? "https://rpc.testnet.chain.robinhood.com"
+          : "https://rpc.mainnet.chain.robinhood.com"),
+      usdcAddress:
+        process.env.USDG_ROBINHOOD || USDG_ROBINHOOD_MAINNET,
+      chainId: isTestnet
+        ? ROBINHOOD_CHAIN_ID_TESTNET
+        : ROBINHOOD_CHAIN_ID_MAINNET,
+      stablecoinSymbol: "USDG" as const,
     };
   }
   return {
@@ -135,6 +161,7 @@ const getChainConfig = (chain: Chain) => {
     usdcAddress: getRpcUrl().includes("mainnet")
       ? USDC_MAINNET_MINT
       : USDC_DEVNET_MINT,
+    stablecoinSymbol: "USDC" as const,
   };
 };
 const LABELS_PATH =
@@ -507,15 +534,19 @@ async function getVaultKey(purpose: string = "vault"): Promise<Keypair> {
 }
 
 /**
- * Derives the Base (EVM) wallet from the TEE environment.
+ * Derives an EVM vault wallet from the TEE environment for Base or Robinhood.
  * Uses the same key derivation pattern but for EVM addresses.
  */
-async function getBaseVaultKey(purpose: string = "vault"): Promise<Wallet> {
-  const chainConfig = getChainConfig("base");
+async function getEvmVaultKey(
+  chain: "base" | "robinhood" = "base",
+  purpose: string = "vault",
+): Promise<Wallet> {
+  const chainConfig = getChainConfig(chain);
   const provider = new ethers.JsonRpcProvider(chainConfig.rpcUrl);
+  const keySuffix = chain === "robinhood" ? "robinhood" : "base";
 
   try {
-    const keyId = `mystery-gift-${purpose}-base-vault-v1`;
+    const keyId = `mystery-gift-${purpose}-${keySuffix}-vault-v1`;
 
     // Attempt TEE derivation using DstackClient
     const dstack = new DstackClient();
@@ -527,13 +558,13 @@ async function getBaseVaultKey(purpose: string = "vault"): Promise<Wallet> {
   } catch (e) {
     if (process.env.PHALA_TEE === "true") {
       console.error(
-        "[TEE] CRITICAL: Failed to derive Base key in TEE environment!",
+        `[TEE] CRITICAL: Failed to derive ${chain} key in TEE environment!`,
       );
       throw e;
     }
 
     console.warn(
-      "[TEE] Base derivation failed (Simulated/Local Mode). Using deterministic fallback key.",
+      `[TEE] ${chain} derivation failed (Simulated/Local Mode). Using deterministic fallback key.`,
     );
 
     // Fallback deterministic key for local testing
@@ -541,6 +572,11 @@ async function getBaseVaultKey(purpose: string = "vault"): Promise<Wallet> {
     const privateKey = Buffer.from(fallbackSeed).toString("hex");
     return new Wallet(privateKey, provider);
   }
+}
+
+/** @deprecated use getEvmVaultKey('base') */
+async function getBaseVaultKey(purpose: string = "vault"): Promise<Wallet> {
+  return getEvmVaultKey("base", purpose);
 }
 
 /**
@@ -552,16 +588,27 @@ async function getBaseVaultAddress(purpose: string = "vault"): Promise<string> {
 }
 
 /**
- * Transfer NFT on Base chain (ERC-721).
+ * Get Robinhood Chain vault public address.
  */
-async function transferNftBase(
+async function getRobinhoodVaultAddress(
+  purpose: string = "vault",
+): Promise<string> {
+  const wallet = await getEvmVaultKey("robinhood", purpose);
+  return wallet.address;
+}
+
+/**
+ * Transfer NFT on Base or Robinhood Chain (ERC-721).
+ */
+async function transferNftEvm(
+  chain: "base" | "robinhood",
   mint: string,
   recipient: string,
-  fromAddress: string,
+  _fromAddress: string,
 ): Promise<{ success: boolean; txHash?: string; error?: string }> {
   try {
-    const wallet = await getBaseVaultKey("vault");
-    const chainConfig = getChainConfig("base");
+    const wallet = await getEvmVaultKey(chain, "vault");
+    const chainConfig = getChainConfig(chain);
     const provider = new ethers.JsonRpcProvider(chainConfig.rpcUrl);
 
     // ERC-721 transfer ABI (safeTransferFrom)
@@ -601,42 +648,56 @@ async function transferNftBase(
   }
 }
 
+/** @deprecated use transferNftEvm('base', ...) */
+async function transferNftBase(
+  mint: string,
+  recipient: string,
+  fromAddress: string,
+): Promise<{ success: boolean; txHash?: string; error?: string }> {
+  return transferNftEvm("base", mint, recipient, fromAddress);
+}
+
 /**
- * Transfer USDC on Base chain (ERC-20).
+ * Transfer ERC-20 stablecoin on Base (USDC) or Robinhood Chain (USDG).
  */
-async function transferUsdcBase(
+async function transferEvmStablecoin(
+  chain: "base" | "robinhood",
   recipient: string,
   amountUsd: number,
 ): Promise<{ success: boolean; txHash?: string; error?: string }> {
   try {
-    const wallet = await getBaseVaultKey("vault");
-    const chainConfig = getChainConfig("base");
-    const provider = new ethers.JsonRpcProvider(chainConfig.rpcUrl);
+    const wallet = await getEvmVaultKey(chain, "vault");
+    const chainConfig = getChainConfig(chain);
+    const symbol = chainConfig.stablecoinSymbol || "USDC";
 
-    // USDC ERC-20 ABI
-    const usdcAbi = [
+    // ERC-20 ABI
+    const erc20Abi = [
       "function transfer(address to, uint256 amount) returns (bool)",
       "function decimals() view returns (uint8)",
       "function balanceOf(address owner) view returns (uint256)",
     ];
 
-    const usdcContract = new Contract(chainConfig.usdcAddress, usdcAbi, wallet);
+    const tokenContract = new Contract(
+      chainConfig.usdcAddress,
+      erc20Abi,
+      wallet,
+    );
 
     // Get decimals
-    const decimals = await usdcContract.decimals();
+    const decimals = await tokenContract.decimals();
     const amountRaw = ethers.parseUnits(amountUsd.toString(), decimals);
 
     // Check balance
-    const balance = await usdcContract.balanceOf(wallet.address);
+    const balance = await tokenContract.balanceOf(wallet.address);
     if (balance < amountRaw) {
       return {
         success: false,
-        error: `Insufficient USDC balance. Have ${ethers.formatUnits(balance, decimals)}, need ${amountUsd}`,
+        error: `Insufficient ${symbol} balance. Have ${ethers.formatUnits(balance, decimals)}, need ${amountUsd}`,
       };
     }
 
     // Transfer
-    const tx = await usdcContract.transfer(recipient, amountRaw);
+    const tx = await tokenContract.transfer(recipient, amountRaw);
     await tx.wait();
 
     return { success: true, txHash: tx.hash };
@@ -649,6 +710,66 @@ async function transferUsdcBase(
 }
 
 /**
+ * Transfer USDC on Base chain (ERC-20).
+ */
+async function transferUsdcBase(
+  recipient: string,
+  amountUsd: number,
+): Promise<{ success: boolean; txHash?: string; error?: string }> {
+  return transferEvmStablecoin("base", recipient, amountUsd);
+}
+
+/**
+ * Transfer USDG on Robinhood Chain (ERC-20).
+ */
+async function transferUsdgRobinhood(
+  recipient: string,
+  amountUsd: number,
+): Promise<{ success: boolean; txHash?: string; error?: string }> {
+  return transferEvmStablecoin("robinhood", recipient, amountUsd);
+}
+
+/**
+ * Get EVM vault stablecoin balance (Base USDC or Robinhood USDG).
+ */
+async function getEvmStablecoinBalance(
+  chain: "base" | "robinhood",
+): Promise<{
+  balance: number;
+  address: string;
+  symbol: string;
+  chainId: number;
+}> {
+  try {
+    const wallet = await getEvmVaultKey(chain, "vault");
+    const chainConfig = getChainConfig(chain);
+    const provider = new ethers.JsonRpcProvider(chainConfig.rpcUrl);
+    const symbol = chainConfig.stablecoinSymbol || "USDC";
+
+    const erc20Abi = [
+      "function decimals() view returns (uint8)",
+      "function balanceOf(address owner) view returns (uint256)",
+    ];
+
+    const tokenContract = new Contract(
+      chainConfig.usdcAddress,
+      erc20Abi,
+      provider,
+    );
+    const decimals = await tokenContract.decimals();
+    const raw = await tokenContract.balanceOf(wallet.address);
+    return {
+      balance: Number(ethers.formatUnits(raw, decimals)),
+      address: wallet.address,
+      symbol,
+      chainId: chainConfig.chainId ?? 0,
+    };
+  } catch (error) {
+    throw error;
+  }
+}
+
+/**
  * Get Base vault USDC balance.
  */
 async function getBaseUsdcBalance(): Promise<{
@@ -656,29 +777,26 @@ async function getBaseUsdcBalance(): Promise<{
   address: string;
 }> {
   try {
-    const wallet = await getBaseVaultKey("vault");
-    const chainConfig = getChainConfig("base");
-    const provider = new ethers.JsonRpcProvider(chainConfig.rpcUrl);
-
-    const usdcAbi = [
-      "function decimals() view returns (uint8)",
-      "function balanceOf(address owner) view returns (uint256)",
-    ];
-
-    const usdcContract = new Contract(
-      chainConfig.usdcAddress,
-      usdcAbi,
-      provider,
-    );
-    const decimals = await usdcContract.decimals();
-    const balance = await usdcContract.balanceOf(wallet.address);
-
-    return {
-      balance: Number(ethers.formatUnits(balance, decimals)),
-      address: wallet.address,
-    };
-  } catch (error) {
+    const result = await getEvmStablecoinBalance("base");
+    return { balance: result.balance, address: result.address };
+  } catch {
     return { balance: 0, address: "" };
+  }
+}
+
+/**
+ * Get Robinhood Chain vault USDG balance.
+ */
+async function getRobinhoodUsdgBalance(): Promise<{
+  balance: number;
+  address: string;
+  symbol: string;
+  chainId: number;
+}> {
+  try {
+    return await getEvmStablecoinBalance("robinhood");
+  } catch {
+    return { balance: 0, address: "", symbol: "USDG", chainId: 4663 };
   }
 }
 
@@ -779,6 +897,13 @@ app.get("/health", async (req, res) => {
     version: process.env.APP_VERSION || "0.1.0",
     environment: process.env.APP_ENVIRONMENT || "development",
     tee: process.env.PHALA_TEE ? "active" : "simulated",
+    supportedChains: ["solana", "base", "robinhood"],
+    robinhood: {
+      chainId: getChainConfig("robinhood").chainId,
+      caip: `eip155:${getChainConfig("robinhood").chainId}`,
+      stablecoin: "USDG",
+      usdg: getChainConfig("robinhood").usdcAddress,
+    },
     checks,
     timestamp: new Date().toISOString(),
   });
@@ -795,13 +920,30 @@ app.get("/", (_req, res) => {
 app.get("/public-key", authMiddleware, async (req, res) => {
   try {
     const purpose = (req.query?.purpose as string) || "vault";
+    const chain = (req.query?.chain as string) || "solana";
     if (!VALID_PURPOSES.has(purpose)) {
       return res.status(400).json({ error: "Invalid purpose" });
+    }
+
+    if (chain === "base" || chain === "robinhood") {
+      const address =
+        chain === "robinhood"
+          ? await getRobinhoodVaultAddress(purpose)
+          : await getBaseVaultAddress(purpose);
+      const cfg = getChainConfig(chain);
+      return res.json({
+        publicKey: address,
+        address,
+        chain,
+        chainId: cfg.chainId,
+        caip: `eip155:${cfg.chainId}`,
+      });
     }
 
     const keypair = await getVaultKey(purpose);
     res.json({
       publicKey: keypair.publicKey.toBase58(),
+      chain: "solana",
     });
   } catch (error: any) {
     console.error("[Wallet Service] Error:", error);
@@ -956,7 +1098,7 @@ app.post("/mint-nft", authMiddleware, async (req, res) => {
 
 /**
  * Transfer an NFT using the vault key inside TEE.
- * Body: { mint: string; recipient: string; amount?: number; chain?: 'solana' | 'base' }
+ * Body: { mint: string; recipient: string; amount?: number; chain?: 'solana' | 'base' | 'robinhood' }
  */
 app.post("/transfer-nft", authMiddleware, async (req, res) => {
   try {
@@ -971,21 +1113,35 @@ app.post("/transfer-nft", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "mint and recipient are required" });
     }
 
-    const targetChain = (chain === "base" ? "base" : "solana") as Chain;
+    const targetChain = (
+      chain === "base" || chain === "robinhood" ? chain : "solana"
+    ) as Chain;
 
-    // Handle Base chain transfers
-    if (targetChain === "base") {
-      const vaultAddress = await getBaseVaultAddress("vault");
-      const result = await transferNftBase(mint, recipient, vaultAddress);
+    // Handle EVM chain transfers (Base / Robinhood)
+    if (targetChain === "base" || targetChain === "robinhood") {
+      const vaultAddress =
+        targetChain === "robinhood"
+          ? await getRobinhoodVaultAddress("vault")
+          : await getBaseVaultAddress("vault");
+      const result = await transferNftEvm(
+        targetChain,
+        mint,
+        recipient,
+        vaultAddress,
+      );
 
       if (result.success) {
         return res.json({
           success: true,
           signature: result.txHash,
-          chain: "base",
+          chain: targetChain,
+          caip:
+            targetChain === "robinhood" ? "eip155:4663" : "eip155:8453",
         });
       } else {
-        return res.status(500).json({ error: result.error, chain: "base" });
+        return res
+          .status(500)
+          .json({ error: result.error, chain: targetChain });
       }
     }
 
@@ -1196,13 +1352,42 @@ app.post("/transfer-usdc", authMiddleware, async (req, res) => {
 });
 
 /**
- * Get vault USDC balance
+ * Get vault USDC balance (Solana by default; ?chain=base for Base USDC; ?chain=robinhood for USDG)
  */
 app.get("/usdc-balance", authMiddleware, async (req, res) => {
   try {
     const purpose = (req.query?.purpose as string) || "vault";
+    const chain = (req.query?.chain as string) || "solana";
     if (!VALID_PURPOSES.has(purpose)) {
       return res.status(400).json({ error: "Invalid purpose" });
+    }
+
+    if (chain === "base") {
+      const bal = await getBaseUsdcBalance();
+      return res.json({
+        success: true,
+        balance: bal.balance,
+        decimals: USDC_DECIMALS_BASE,
+        symbol: "USDC",
+        wallet: bal.address,
+        chain: "base",
+        caip: "eip155:8453",
+      });
+    }
+
+    if (chain === "robinhood") {
+      const bal = await getRobinhoodUsdgBalance();
+      return res.json({
+        success: true,
+        balance: bal.balance,
+        decimals: USDG_DECIMALS,
+        symbol: "USDG",
+        usdg: getChainConfig("robinhood").usdcAddress,
+        wallet: bal.address,
+        chain: "robinhood",
+        chainId: bal.chainId,
+        caip: `eip155:${bal.chainId}`,
+      });
     }
 
     const connection = new Connection(getRpcUrl(), "confirmed");
