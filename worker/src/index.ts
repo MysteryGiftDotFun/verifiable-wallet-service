@@ -1102,6 +1102,17 @@ app.post("/mint-nft", authMiddleware, async (req, res) => {
  */
 app.post("/transfer-nft", authMiddleware, async (req, res) => {
   try {
+    // Rate limit NFT transfers the same as USDC outflows
+    const clientIp = getClientIp(req);
+    const rateCheck = await checkRateLimit(clientIp);
+    if (!rateCheck.allowed) {
+      console.warn(`[TEE] Rate limit exceeded for IP: ${clientIp} (transfer-nft)`);
+      return res.status(429).json({
+        error: "Too many transfer requests. Please try again later.",
+        retryAfter: rateCheck.retryAfter,
+      });
+    }
+
     const { mint, recipient, amount, chain } = req.body as {
       mint?: string;
       recipient?: string;
@@ -2348,6 +2359,16 @@ async function simulateMarketplaceSpend(
  */
 app.post("/sign-transaction", authMiddleware, async (req, res) => {
   try {
+    const clientIp = getClientIp(req);
+    const rateCheck = await checkRateLimit(clientIp);
+    if (!rateCheck.allowed) {
+      console.warn(`[TEE] Rate limit exceeded for IP: ${clientIp} (sign-transaction)`);
+      return res.status(429).json({
+        error: "Too many transfer requests. Please try again later.",
+        retryAfter: rateCheck.retryAfter,
+      });
+    }
+
     const {
       transactionBase64,
       validationContext,
