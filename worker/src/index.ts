@@ -1358,7 +1358,7 @@ app.post("/transfer-usdc", authMiddleware, async (req, res) => {
     });
   } catch (error: any) {
     console.error("[TEE] USDC transfer failed:", error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: sanitizeError(error) });
   }
 });
 
@@ -2068,23 +2068,28 @@ async function validateVaultTransferInstructions(
     return `Too many instructions: ${instructions.length} (max 3)`;
   }
 
-  let expectedSourceAta: PublicKey | null = null;
-  let expectedDestinationAta: PublicKey | null = null;
-  let expectedMintKey: PublicKey | null = null;
-  let expectedRecipientKey: PublicKey | null = null;
+  // vault_transfer always requires mint + recipient binding (body: mint + toAddress)
+  if (!context.expectedMint || !context.expectedRecipient) {
+    return "expectedMint and expectedRecipient are required for vault_transfer (send mint + toAddress)";
+  }
 
-  if (context.expectedMint && context.expectedRecipient) {
+  let expectedMintKey: PublicKey;
+  let expectedRecipientKey: PublicKey;
+  try {
     expectedMintKey = new PublicKey(context.expectedMint);
     expectedRecipientKey = new PublicKey(context.expectedRecipient);
-    expectedSourceAta = getAssociatedTokenAddressSync(
-      expectedMintKey,
-      vaultPublicKey,
-    );
-    expectedDestinationAta = getAssociatedTokenAddressSync(
-      expectedMintKey,
-      expectedRecipientKey,
-    );
+  } catch {
+    return "Invalid expectedMint or expectedRecipient public key";
   }
+
+  const expectedSourceAta = getAssociatedTokenAddressSync(
+    expectedMintKey,
+    vaultPublicKey,
+  );
+  const expectedDestinationAta = getAssociatedTokenAddressSync(
+    expectedMintKey,
+    expectedRecipientKey,
+  );
 
   for (const ix of instructions) {
     const programId = ix.programId;
@@ -2105,21 +2110,18 @@ async function validateVaultTransferInstructions(
         return `Invalid authority: ${authority.toBase58()}. Expected vault: ${vaultPublicKey.toBase58()}`;
       }
 
-      if (expectedSourceAta && !ix.keys[0].pubkey.equals(expectedSourceAta)) {
+      if (!ix.keys[0].pubkey.equals(expectedSourceAta)) {
         return `Invalid source ATA: ${ix.keys[0].pubkey.toBase58()}`;
       }
 
       const destinationIndex = instructionType === 12 ? 2 : 1;
-      if (
-        expectedDestinationAta &&
-        !ix.keys[destinationIndex].pubkey.equals(expectedDestinationAta)
-      ) {
+      if (!ix.keys[destinationIndex].pubkey.equals(expectedDestinationAta)) {
         return `Invalid destination ATA: ${ix.keys[
           destinationIndex
         ].pubkey.toBase58()}`;
       }
 
-      if (instructionType === 12 && expectedMintKey) {
+      if (instructionType === 12) {
         if (!ix.keys[1].pubkey.equals(expectedMintKey)) {
           return `Invalid mint: ${ix.keys[1].pubkey.toBase58()}`;
         }
@@ -2138,26 +2140,30 @@ async function validateVaultTransferInstructions(
         return `Invalid ATA payer: ${payer.toBase58()}. Expected vault: ${vaultPublicKey.toBase58()}`;
       }
 
-      if (expectedDestinationAta && !ix.keys[1].pubkey.equals(expectedDestinationAta)) {
+      if (!ix.keys[1].pubkey.equals(expectedDestinationAta)) {
         return `Invalid ATA address: ${ix.keys[1].pubkey.toBase58()}`;
       }
 
-      if (expectedRecipientKey && !ix.keys[2].pubkey.equals(expectedRecipientKey)) {
+      if (!ix.keys[2].pubkey.equals(expectedRecipientKey)) {
         return `Invalid ATA owner: ${ix.keys[2].pubkey.toBase58()}`;
       }
 
-      if (expectedMintKey && !ix.keys[3].pubkey.equals(expectedMintKey)) {
+      if (!ix.keys[3].pubkey.equals(expectedMintKey)) {
         return `Invalid ATA mint: ${ix.keys[3].pubkey.toBase58()}`;
       }
 
       continue;
     }
 
-    if (
-      programId.equals(SYSTEM_PROGRAM_ID) ||
-      programId.equals(COMPUTE_BUDGET_ID)
-    ) {
+    // COMPUTE_BUDGET only — SYSTEM_PROGRAM is disallowed for vault_transfer
+    // (prevents arbitrary SOL drain if vault secret is compromised).
+    // Magic Eden buy flow may still include SYSTEM_PROGRAM under its own context type.
+    if (programId.equals(COMPUTE_BUDGET_ID)) {
       continue;
+    }
+
+    if (programId.equals(SYSTEM_PROGRAM_ID)) {
+      return "SYSTEM_PROGRAM instructions are not allowed for vault_transfer";
     }
 
     return `Unauthorized program: ${programId.toBase58()}`;
@@ -2389,6 +2395,41 @@ app.post("/sign-transaction", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "Missing transactionBase64" });
     }
 
+    // Resolve validation context: body mint/toAddress map to expectedMint/expectedRecipient
+    const resolvedContext: TransactionValidationContext =
+      validationContext || {
+        type: "vault_transfer",
+        expectedRecipient: toAddress,
+        expectedMint: mint,
+      };
+
+    if (!resolvedContext.type || resolvedContext.type === "vault_transfer") {
+      const expectedMint =
+        (resolvedContext as { expectedMint?: string }).expectedMint || mint;
+      const expectedRecipient =
+        (resolvedContext as { expectedRecipient?: string }).expectedRecipient ||
+        toAddress;
+      if (!expectedMint || !expectedRecipient) {
+        return res.status(400).json({
+          error:
+            "mint and toAddress are required for vault_transfer signing (bind NFT + recipient)",
+        });
+      }
+      (resolvedContext as {
+        type?: "vault_transfer";
+        expectedMint?: string;
+        expectedRecipient?: string;
+      }).type = "vault_transfer";
+      (resolvedContext as {
+        expectedMint?: string;
+        expectedRecipient?: string;
+      }).expectedMint = expectedMint;
+      (resolvedContext as {
+        expectedMint?: string;
+        expectedRecipient?: string;
+      }).expectedRecipient = expectedRecipient;
+    }
+
     // 1. Recover Transaction
     const txBuffer = Buffer.from(transactionBase64, "base64");
     const decoded = await decodeTransaction(txBuffer);
@@ -2400,11 +2441,7 @@ app.post("/sign-transaction", authMiddleware, async (req, res) => {
     const validationError = await validateTransactionInstructions(
       decoded,
       keypair.publicKey,
-      validationContext || {
-        type: "vault_transfer",
-        expectedRecipient: toAddress,
-        expectedMint: mint,
-      },
+      resolvedContext,
     );
     if (validationError) {
       console.error(`[TEE] Transaction validation failed: ${validationError}`);
@@ -2417,12 +2454,12 @@ app.post("/sign-transaction", authMiddleware, async (req, res) => {
     // 4. Partial Sign
     signDecodedTransaction(decoded, keypair);
 
-    if (validationContext?.type === "magiceden_buy_now") {
+    if (resolvedContext.type === "magiceden_buy_now") {
       const postSignValidationError = await simulateMarketplaceSpend(
         decoded,
         keypair.publicKey,
-        new PublicKey(validationContext.expectedSeller),
-        validationContext.maxLamports,
+        new PublicKey(resolvedContext.expectedSeller),
+        resolvedContext.maxLamports,
       );
 
       if (postSignValidationError) {
@@ -2449,7 +2486,7 @@ app.post("/sign-transaction", authMiddleware, async (req, res) => {
     });
   } catch (error: any) {
     console.error("Signing error:", error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: sanitizeError(error) });
   }
 });
 
