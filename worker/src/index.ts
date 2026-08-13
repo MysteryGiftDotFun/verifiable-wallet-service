@@ -34,6 +34,14 @@ import {
 } from "@metaplex-foundation/mpl-token-metadata";
 import { DstackClient } from "@phala/dstack-sdk";
 import { ethers, Wallet, Contract } from "ethers";
+import {
+  DAILY_LIMIT_USD,
+  releaseMemory,
+  releaseRedis,
+  tryReserveMemory,
+  tryReserveRedis,
+  type ReserveResult,
+} from "./daily-cap";
 
 const app = express();
 app.use(express.json());
@@ -226,7 +234,7 @@ type DecodedTransaction =
 const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
 const RATE_LIMIT_WINDOW_SECS = 3600;
 const RATE_LIMIT_MAX_REQUESTS = 10; // Max 10 USDC transfers per hour per IP
-const DAILY_LIMIT_USD = 50000; // $50,000 daily aggregate limit
+// DAILY_LIMIT_USD imported from ./daily-cap ($50,000 daily aggregate USDC only)
 
 // Redis client for persistent rate limits
 function loadRedisConstructor(): any {
@@ -317,15 +325,29 @@ function initRedis(): void {
 
 initRedis();
 
-// In-memory fallback stores
+/** Production money routes fail closed without Redis (no in-memory fallback). */
+function moneyRoutesRequireRedis(): boolean {
+  const env = (
+    process.env.APP_ENVIRONMENT ||
+    process.env.NODE_ENV ||
+    ""
+  ).toLowerCase();
+  return env === "production";
+}
+
+function redisReadyForMoney(): boolean {
+  return Boolean(redisAvailable && redis);
+}
+
+// In-memory fallback stores (dev/test only when Redis is absent)
 const rateLimitStore = new Map<string, { count: number; resetTime: number }>();
-let dailyTransferredUsd = 0;
+const dailyMemoryState = { total: 0 };
 let dailyResetTime = Date.now() + 24 * 60 * 60 * 1000;
 
 function resetDailyLimitIfNeeded(): void {
   const now = Date.now();
   if (now >= dailyResetTime) {
-    dailyTransferredUsd = 0;
+    dailyMemoryState.total = 0;
     dailyResetTime = now + 24 * 60 * 60 * 1000;
     console.log("[TEE] Daily transfer limit reset (in-memory)");
   }
@@ -382,40 +404,81 @@ async function checkRateLimit(
   return { allowed: true };
 }
 
-async function getDailyTransferred(): Promise<number> {
+/**
+ * Atomically reserve `amountUsd` against the daily USDC cap BEFORE send.
+ * On success the reservation is kept (do not add again after transfer).
+ * On send/setup failure call releaseDailyUsd.
+ * NFT transfers must NOT use this counter.
+ */
+async function tryReserveDailyUsd(amountUsd: number): Promise<ReserveResult> {
   if (redisAvailable && redis) {
     try {
-      const val = await redis.get("daily_transferred_usd");
-      return val ? parseFloat(val) : 0;
-    } catch {
-      // Fall through to in-memory
+      const result = await tryReserveRedis(
+        redis,
+        amountUsd,
+        secondsUntilMidnightUtc(),
+      );
+      if (result.ok) {
+        console.log(
+          `[TEE] Daily USDC reserved (Redis): $${result.used.toFixed(2)} / $${DAILY_LIMIT_USD}`,
+        );
+      } else {
+        console.warn(
+          `[TEE] Daily USDC reserve rejected (Redis): used=$${result.used.toFixed(2)}, requested=$${amountUsd}, limit=$${DAILY_LIMIT_USD}`,
+        );
+      }
+      return result;
+    } catch (err) {
+      console.error(
+        "[TEE] Redis daily reserve failed:",
+        err instanceof Error ? err.message : String(err),
+      );
+      if (moneyRoutesRequireRedis()) {
+        return { ok: false, used: 0, reason: "backend" };
+      }
+      // Dev: fall through to in-memory
+    }
+  } else if (moneyRoutesRequireRedis()) {
+    return { ok: false, used: 0, reason: "backend" };
+  }
+
+  resetDailyLimitIfNeeded();
+  const result = tryReserveMemory(dailyMemoryState, amountUsd);
+  if (result.ok) {
+    console.log(
+      `[TEE] Daily USDC reserved (in-memory): $${result.used.toFixed(2)} / $${DAILY_LIMIT_USD}`,
+    );
+  } else {
+    console.warn(
+      `[TEE] Daily USDC reserve rejected (in-memory): used=$${result.used.toFixed(2)}, requested=$${amountUsd}, limit=$${DAILY_LIMIT_USD}`,
+    );
+  }
+  return result;
+}
+
+/** Release a prior USDC daily reservation when the transfer did not complete. */
+async function releaseDailyUsd(amountUsd: number): Promise<void> {
+  if (redisAvailable && redis) {
+    try {
+      const newVal = await releaseRedis(redis, amountUsd);
+      console.log(
+        `[TEE] Daily USDC reservation released (Redis): now $${newVal.toFixed(2)} / $${DAILY_LIMIT_USD}`,
+      );
+      return;
+    } catch (err) {
+      console.error(
+        "[TEE] Redis daily release failed:",
+        err instanceof Error ? err.message : String(err),
+      );
+      if (moneyRoutesRequireRedis()) {
+        return;
+      }
     }
   }
   resetDailyLimitIfNeeded();
-  return dailyTransferredUsd;
-}
-
-async function addDailyTransferred(amountUsd: number): Promise<void> {
-  if (redisAvailable && redis) {
-    try {
-      const key = "daily_transferred_usd";
-      const newVal = await redis.incrbyfloat(key, amountUsd);
-      // Set TTL to midnight UTC if not already set
-      const ttl = await redis.ttl(key);
-      if (ttl < 0) {
-        await redis.expire(key, secondsUntilMidnightUtc());
-      }
-      console.log(
-        `[TEE] Daily transferred total (Redis): $${parseFloat(String(newVal)).toFixed(2)} / $${DAILY_LIMIT_USD}`,
-      );
-      return;
-    } catch {
-      // Fall through to in-memory
-    }
-  }
-  dailyTransferredUsd += amountUsd;
+  releaseMemory(dailyMemoryState, amountUsd);
   console.log(
-    `[TEE] Daily transferred total (in-memory): $${dailyTransferredUsd.toFixed(2)} / $${DAILY_LIMIT_USD}`,
+    `[TEE] Daily USDC reservation released (in-memory): now $${dailyMemoryState.total.toFixed(2)} / $${DAILY_LIMIT_USD}`,
   );
 }
 
@@ -1102,6 +1165,13 @@ app.post("/mint-nft", authMiddleware, async (req, res) => {
  */
 app.post("/transfer-nft", authMiddleware, async (req, res) => {
   try {
+    // Production: money routes require Redis (rate limits). NFT does NOT consume USDC daily cap.
+    if (moneyRoutesRequireRedis() && !redisReadyForMoney()) {
+      return res
+        .status(503)
+        .json({ error: "rate_limit_backend_unavailable" });
+    }
+
     // Rate limit NFT transfers the same as USDC outflows
     const clientIp = getClientIp(req);
     const rateCheck = await checkRateLimit(clientIp);
@@ -1216,7 +1286,16 @@ app.post("/transfer-nft", authMiddleware, async (req, res) => {
  * Body: { recipient: string; amountUsd: number; memo?: string }
  */
 app.post("/transfer-usdc", authMiddleware, async (req, res) => {
+  // Tracks reservation so setup/send failures release the daily cap slot.
+  // Cleared on success so we keep the reservation (no second add).
+  let reservedAmount: number | null = null;
   try {
+    if (moneyRoutesRequireRedis() && !redisReadyForMoney()) {
+      return res
+        .status(503)
+        .json({ error: "rate_limit_backend_unavailable" });
+    }
+
     // Rate limiting check
     const clientIp = getClientIp(req);
     const rateCheck = await checkRateLimit(clientIp);
@@ -1252,18 +1331,21 @@ app.post("/transfer-usdc", authMiddleware, async (req, res) => {
       });
     }
 
-    // Check daily aggregate limit
-    const currentDailyTotal = await getDailyTransferred();
-    if (currentDailyTotal + amountUsd > DAILY_LIMIT_USD) {
-      console.warn(
-        `[TEE] Daily limit would be exceeded: current=$${currentDailyTotal}, requested=$${amountUsd}, limit=$${DAILY_LIMIT_USD}`,
-      );
+    // Reserve daily aggregate BEFORE send (atomic; concurrent requests cannot race).
+    const reserve = await tryReserveDailyUsd(amountUsd);
+    if (!reserve.ok) {
+      if (reserve.reason === "backend") {
+        return res
+          .status(503)
+          .json({ error: "rate_limit_backend_unavailable" });
+      }
       return res.status(400).json({
-        error: `Daily transfer limit would be exceeded. Limit: $${DAILY_LIMIT_USD}, Used: $${currentDailyTotal.toFixed(2)}, Requested: $${amountUsd}`,
-        dailyUsed: currentDailyTotal,
+        error: `Daily transfer limit would be exceeded. Limit: $${DAILY_LIMIT_USD}, Used: $${reserve.used.toFixed(2)}, Requested: $${amountUsd}`,
+        dailyUsed: reserve.used,
         dailyLimit: DAILY_LIMIT_USD,
       });
     }
+    reservedAmount = amountUsd;
 
     const connection = new Connection(getRpcUrl(), "confirmed");
     const vaultKeypair = await getVaultKey("vault");
@@ -1346,8 +1428,8 @@ app.post("/transfer-usdc", authMiddleware, async (req, res) => {
 
     console.log(`[TEE] USDC transfer completed: ${sig}`);
 
-    // Update daily aggregate after successful transfer
-    await addDailyTransferred(amountUsd);
+    // Keep reservation — do not add again (already reserved before send).
+    reservedAmount = null;
 
     res.json({
       success: true,
@@ -1359,6 +1441,17 @@ app.post("/transfer-usdc", authMiddleware, async (req, res) => {
   } catch (error: any) {
     console.error("[TEE] USDC transfer failed:", error);
     res.status(500).json({ error: sanitizeError(error) });
+  } finally {
+    if (reservedAmount != null) {
+      try {
+        await releaseDailyUsd(reservedAmount);
+      } catch (releaseErr) {
+        console.error(
+          "[TEE] Failed to release daily USDC reservation after transfer failure:",
+          releaseErr instanceof Error ? releaseErr.message : String(releaseErr),
+        );
+      }
+    }
   }
 });
 
@@ -2365,6 +2458,12 @@ async function simulateMarketplaceSpend(
  */
 app.post("/sign-transaction", authMiddleware, async (req, res) => {
   try {
+    if (moneyRoutesRequireRedis() && !redisReadyForMoney()) {
+      return res
+        .status(503)
+        .json({ error: "rate_limit_backend_unavailable" });
+    }
+
     const clientIp = getClientIp(req);
     const rateCheck = await checkRateLimit(clientIp);
     if (!rateCheck.allowed) {

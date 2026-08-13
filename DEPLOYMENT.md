@@ -17,6 +17,7 @@ phala deploy --compose phala-compose.yaml -e .env
 ## Required Environment
 
 - `WALLET_SERVICE_SECRET`
+- `REDIS_URL` — required in production for money routes (rate limits + USDC daily cap); without it those routes return 503
 
 Common production settings:
 
