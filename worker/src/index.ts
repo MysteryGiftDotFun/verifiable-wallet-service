@@ -42,6 +42,7 @@ import {
   tryReserveRedis,
   type ReserveResult,
 } from "./daily-cap";
+import { assertNftTransferAmount } from "./transfer-nft-policy";
 
 const app = express();
 app.use(express.json());
@@ -1186,7 +1187,7 @@ app.post("/transfer-nft", authMiddleware, async (req, res) => {
     const { mint, recipient, amount, chain } = req.body as {
       mint?: string;
       recipient?: string;
-      amount?: number;
+      amount?: unknown;
       chain?: string;
     };
 
@@ -1200,6 +1201,19 @@ app.post("/transfer-nft", authMiddleware, async (req, res) => {
 
     // Handle EVM chain transfers (Base / Robinhood)
     if (targetChain === "base" || targetChain === "robinhood") {
+      const evmPolicy = assertNftTransferAmount({
+        mint,
+        amount,
+        blockedMints: [
+          USDC_BASE_MAINNET,
+          USDC_BASE_SEPOLIA,
+          USDG_ROBINHOOD_MAINNET,
+        ],
+      });
+      if (!evmPolicy.ok) {
+        return res.status(evmPolicy.status).json({ error: evmPolicy.error });
+      }
+
       const vaultAddress =
         targetChain === "robinhood"
           ? await getRobinhoodVaultAddress("vault")
@@ -1227,11 +1241,20 @@ app.post("/transfer-nft", authMiddleware, async (req, res) => {
     }
 
     // Solana transfers (original implementation)
+    const policy = assertNftTransferAmount({
+      mint,
+      amount,
+      blockedMints: [USDC_MAINNET_MINT, USDC_DEVNET_MINT],
+    });
+    if (!policy.ok) {
+      return res.status(policy.status).json({ error: policy.error });
+    }
+    const transferAmount = policy.amount; // always 1
+
     const connection = new Connection(getRpcUrl(), "confirmed");
     const vaultKeypair = await getVaultKey("vault");
     const mintKey = new PublicKey(mint);
     const recipientKey = new PublicKey(recipient);
-    const transferAmount = amount && amount > 0 ? amount : 1;
 
     const sourceAta = await withRetry(
       () =>
