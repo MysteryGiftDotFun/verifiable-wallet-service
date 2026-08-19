@@ -490,15 +490,40 @@ async function releaseDailyUsd(amountUsd: number): Promise<void> {
   );
 }
 
-function getClientIp(req: express.Request): string {
-  // Only trust cf-connecting-ip (set by Cloudflare, not user-controllable)
-  // Do NOT trust x-forwarded-for as it can be spoofed to bypass rate limits
-  const cfIp = req.headers["cf-connecting-ip"];
-  if (typeof cfIp === "string") {
-    return cfIp;
+/**
+ * Client IP for rate limiting on TEE origins.
+ * Trust CF / XFF only when TRUST_PROXY=true; otherwise use socket remote.
+ * Direct CVM hits can spoof cf-connecting-ip / X-Forwarded-For.
+ */
+function originClientIp(args: {
+  cfConnectingIp?: string;
+  xForwardedFor?: string;
+  socketRemote?: string;
+  trustProxy: boolean;
+}): string {
+  if (args.trustProxy) {
+    const cf = args.cfConnectingIp?.trim();
+    if (cf) return cf;
+    const xff = args.xForwardedFor?.split(",")[0]?.trim();
+    if (xff) return xff;
   }
-  // Fallback to socket address
-  return req.socket?.remoteAddress || "unknown";
+  const sock = (args.socketRemote || "").replace(/^::ffff:/, "").trim();
+  return sock || "unknown";
+}
+
+function trustProxyEnabled(): boolean {
+  return (process.env.TRUST_PROXY || "").toLowerCase() === "true";
+}
+
+function getClientIp(req: express.Request): string {
+  const cfIp = req.headers["cf-connecting-ip"];
+  const xff = req.headers["x-forwarded-for"];
+  return originClientIp({
+    cfConnectingIp: typeof cfIp === "string" ? cfIp : undefined,
+    xForwardedFor: typeof xff === "string" ? xff : undefined,
+    socketRemote: req.socket?.remoteAddress,
+    trustProxy: trustProxyEnabled(),
+  });
 }
 
 const rpcUrls = [
