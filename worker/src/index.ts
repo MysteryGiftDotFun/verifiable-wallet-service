@@ -42,7 +42,10 @@ import {
   tryReserveRedis,
   type ReserveResult,
 } from "./daily-cap";
-import { assertNftTransferAmount } from "./transfer-nft-policy";
+import {
+  assertNftTransferAmount,
+  parseSplTransferAmount,
+} from "./transfer-nft-policy";
 
 const app = express();
 app.use(express.json());
@@ -2242,6 +2245,16 @@ async function validateVaultTransferInstructions(
           return `Invalid mint: ${ix.keys[1].pubkey.toBase58()}`;
         }
       }
+
+      const amt = parseSplTransferAmount(ix.data);
+      if (amt === null) return "Invalid Token transfer amount encoding";
+      if (amt !== 1n) return "nft_amount_must_be_1";
+      const mintPolicy = assertNftTransferAmount({
+        mint: expectedMintKey.toBase58(),
+        amount: 1,
+        blockedMints: [USDC_MAINNET_MINT, USDC_DEVNET_MINT],
+      });
+      if (!mintPolicy.ok) return mintPolicy.error;
 
       continue;
     }
