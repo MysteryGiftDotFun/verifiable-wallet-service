@@ -24,6 +24,23 @@ export function parseSplTransferAmount(data: Uint8Array): bigint | null {
   return view.readBigUInt64LE(1);
 }
 
+/**
+ * Count SPL Token Transfer (3) / TransferChecked (12) instructions.
+ * Pass only Token-program instruction datas (or mark others via filter before calling).
+ * vault_transfer requires this count === 1.
+ */
+export function countTokenTransfers(
+  tokenInstructionDatas: ReadonlyArray<Uint8Array>,
+): number {
+  let count = 0;
+  for (const data of tokenInstructionDatas) {
+    if (data.length < 1) continue;
+    const type = data[0];
+    if (type === 3 || type === 12) count++;
+  }
+  return count;
+}
+
 export function assertNftTransferAmount(args: {
   mint: string;
   amount: unknown;

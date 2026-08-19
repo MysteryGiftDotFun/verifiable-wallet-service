@@ -2229,6 +2229,8 @@ async function validateVaultTransferInstructions(
     expectedRecipientKey,
   );
 
+  let tokenTransferCount = 0;
+
   for (const ix of instructions) {
     const programId = ix.programId;
 
@@ -2275,6 +2277,7 @@ async function validateVaultTransferInstructions(
       });
       if (!mintPolicy.ok) return mintPolicy.error;
 
+      tokenTransferCount++;
       continue;
     }
 
@@ -2315,6 +2318,10 @@ async function validateVaultTransferInstructions(
     }
 
     return `Unauthorized program: ${programId.toBase58()}`;
+  }
+
+  if (tokenTransferCount !== 1) {
+    return "vault_transfer requires exactly one Token Transfer";
   }
 
   return null;

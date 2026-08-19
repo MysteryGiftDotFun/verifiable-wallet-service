@@ -2,6 +2,7 @@ import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import {
   assertNftTransferAmount,
+  countTokenTransfers,
   parseSplTransferAmount,
 } from "./transfer-nft-policy";
 
@@ -95,4 +96,43 @@ test("vault_transfer policy: amount=1 on non-USDC mint allowed", () => {
   });
   assert.equal(policy.ok, true);
   if (policy.ok) assert.equal(policy.amount, 1);
+});
+
+test("countTokenTransfers: 0 transfers → reject (count !== 1)", () => {
+  assert.equal(countTokenTransfers([]), 0);
+  // ATA / compute / memo datas are not passed; empty Token list → 0
+  const rejected = countTokenTransfers([]) !== 1;
+  assert.equal(rejected, true);
+});
+
+test("countTokenTransfers: 1 Transfer → ok", () => {
+  const datas = [encodeTransferData(3, 1n)];
+  assert.equal(countTokenTransfers(datas), 1);
+});
+
+test("countTokenTransfers: 1 TransferChecked → ok", () => {
+  const datas = [encodeTransferData(12, 1n)];
+  assert.equal(countTokenTransfers(datas), 1);
+});
+
+test("countTokenTransfers: 2 Transfers → reject (count !== 1)", () => {
+  const datas = [encodeTransferData(3, 1n), encodeTransferData(3, 1n)];
+  assert.equal(countTokenTransfers(datas), 2);
+  const rejected = countTokenTransfers(datas) !== 1;
+  assert.equal(rejected, true);
+});
+
+test("countTokenTransfers: Transfer + TransferChecked → reject", () => {
+  const datas = [encodeTransferData(3, 1n), encodeTransferData(12, 1n)];
+  assert.equal(countTokenTransfers(datas), 2);
+});
+
+test("countTokenTransfers: ignores non-transfer Token instruction types", () => {
+  const approve = encodeTransferData(3, 1n);
+  approve[0] = 7; // Approve
+  assert.equal(countTokenTransfers([approve]), 0);
+  assert.equal(
+    countTokenTransfers([approve, encodeTransferData(3, 1n)]),
+    1,
+  );
 });
