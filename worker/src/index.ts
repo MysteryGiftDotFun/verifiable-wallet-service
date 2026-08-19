@@ -46,6 +46,10 @@ import {
   assertNftTransferAmount,
   parseSplTransferAmount,
 } from "./transfer-nft-policy";
+import {
+  ERC721_SAFE_TRANSFER_FROM_ABI,
+  parseEvmNftTokenId,
+} from "./evm-nft-transfer";
 
 const app = express();
 app.use(express.json());
@@ -665,48 +669,29 @@ async function getRobinhoodVaultAddress(
 }
 
 /**
- * Transfer NFT on Base or Robinhood Chain (ERC-721).
+ * Transfer NFT on Base or Robinhood Chain (ERC-721) via safeTransferFrom.
+ * Caller must validate mint/recipient addresses and tokenId before invoke.
  */
 async function transferNftEvm(
   chain: "base" | "robinhood",
   mint: string,
   recipient: string,
-  _fromAddress: string,
+  tokenId: bigint,
 ): Promise<{ success: boolean; txHash?: string; error?: string }> {
   try {
     const wallet = await getEvmVaultKey(chain, "vault");
     const chainConfig = getChainConfig(chain);
     const provider = new ethers.JsonRpcProvider(chainConfig.rpcUrl);
 
-    // ERC-721 transfer ABI (safeTransferFrom)
-    const erc721Abi = [
-      "function safeTransferFrom(address from, address to, uint256 tokenId) external",
-    ];
+    const nft = new ethers.Contract(
+      mint,
+      ERC721_SAFE_TRANSFER_FROM_ABI,
+      wallet.connect(provider),
+    );
+    const tx = await nft.safeTransferFrom(wallet.address, recipient, tokenId);
+    await tx.wait();
 
-    // For now, we use a simple approach - in production, you'd want to
-    // verify the contract is ERC-721 and call safeTransferFrom
-    // This is a placeholder that would need the actual NFT contract address
-
-    // Build the transaction
-    const nonce = await provider.getTransactionCount(wallet.address);
-    const feeData = await provider.getFeeData();
-
-    const tx = {
-      from: wallet.address,
-      to: mint, // NFT contract address
-      data: ethers.solidityPacked(
-        ["address", "address", "uint256"],
-        [wallet.address, recipient, 1],
-      ),
-      nonce,
-      maxFeePerGas: feeData.maxFeePerGas,
-      maxPriorityFeePerGas: feeData.maxPriorityFeePerGas,
-    };
-
-    const response = await wallet.sendTransaction(tx);
-    await response.wait();
-
-    return { success: true, txHash: response.hash };
+    return { success: true, txHash: tx.hash };
   } catch (error) {
     return {
       success: false,
@@ -719,9 +704,9 @@ async function transferNftEvm(
 async function transferNftBase(
   mint: string,
   recipient: string,
-  fromAddress: string,
+  tokenId: bigint,
 ): Promise<{ success: boolean; txHash?: string; error?: string }> {
-  return transferNftEvm("base", mint, recipient, fromAddress);
+  return transferNftEvm("base", mint, recipient, tokenId);
 }
 
 /**
@@ -1165,7 +1150,8 @@ app.post("/mint-nft", authMiddleware, async (req, res) => {
 
 /**
  * Transfer an NFT using the vault key inside TEE.
- * Body: { mint: string; recipient: string; amount?: number; chain?: 'solana' | 'base' | 'robinhood' }
+ * Body: { mint: string; recipient: string; amount?: number; chain?: 'solana' | 'base' | 'robinhood'; tokenId?: string | number | bigint }
+ * EVM (base/robinhood) requires tokenId (non-negative integer).
  */
 app.post("/transfer-nft", authMiddleware, async (req, res) => {
   try {
@@ -1187,11 +1173,12 @@ app.post("/transfer-nft", authMiddleware, async (req, res) => {
       });
     }
 
-    const { mint, recipient, amount, chain } = req.body as {
+    const { mint, recipient, amount, chain, tokenId } = req.body as {
       mint?: string;
       recipient?: string;
       amount?: unknown;
       chain?: string;
+      tokenId?: string | number | bigint;
     };
 
     if (!mint || !recipient) {
@@ -1217,15 +1204,22 @@ app.post("/transfer-nft", authMiddleware, async (req, res) => {
         return res.status(evmPolicy.status).json({ error: evmPolicy.error });
       }
 
-      const vaultAddress =
-        targetChain === "robinhood"
-          ? await getRobinhoodVaultAddress("vault")
-          : await getBaseVaultAddress("vault");
+      if (!ethers.isAddress(mint) || !ethers.isAddress(recipient)) {
+        return res.status(400).json({
+          error: "mint and recipient must be valid EVM addresses",
+        });
+      }
+
+      const parsedTokenId = parseEvmNftTokenId(tokenId);
+      if (!parsedTokenId.ok) {
+        return res.status(400).json({ error: parsedTokenId.error });
+      }
+
       const result = await transferNftEvm(
         targetChain,
         mint,
         recipient,
-        vaultAddress,
+        parsedTokenId.tokenId,
       );
 
       if (result.success) {
