@@ -1091,6 +1091,24 @@ app.post("/wallets/labels", authMiddleware, async (req, res) => {
  */
 app.post("/mint-nft", authMiddleware, async (req, res) => {
   try {
+    // Production: money routes require Redis (rate limits). NFT does NOT consume USDC daily cap.
+    if (moneyRoutesRequireRedis() && !redisReadyForMoney()) {
+      return res
+        .status(503)
+        .json({ error: "rate_limit_backend_unavailable" });
+    }
+
+    // Rate limit NFT mints the same as USDC outflows
+    const clientIp = getClientIp(req);
+    const rateCheck = await checkRateLimit(clientIp);
+    if (!rateCheck.allowed) {
+      console.warn(`[TEE] Rate limit exceeded for IP: ${clientIp} (mint-nft)`);
+      return res.status(429).json({
+        error: "Too many transfer requests. Please try again later.",
+        retryAfter: rateCheck.retryAfter,
+      });
+    }
+
     const { name, symbol, uri, recipient } = req.body as {
       name?: string;
       symbol?: string;
