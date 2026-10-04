@@ -1,14 +1,13 @@
-FROM node:20-slim
+FROM node:24.21.0-bookworm-slim
 
 WORKDIR /app
 
 # Install curl for healthcheck
-RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
 
 # Install build dependencies
-COPY package.json .
-COPY tsconfig.json .
-RUN npm install
+COPY package.json package-lock.json tsconfig.json ./
+RUN npm ci
 
 # Copy source
 COPY src ./src
@@ -17,7 +16,7 @@ COPY src ./src
 RUN npm run build
 
 # Remove dev dependencies
-RUN npm prune --production
+RUN npm prune --omit=dev
 
 # Verify user (security best practice)
 USER node
