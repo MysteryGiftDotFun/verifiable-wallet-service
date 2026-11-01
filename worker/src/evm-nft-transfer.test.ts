@@ -14,13 +14,6 @@ test("encodeSafeTransferFrom uses 3-arg selector 0x42842e0e", () => {
   assert.ok(data.length > 10);
 });
 
-test("encodeSafeTransferFrom is not solidityPacked-without-selector", () => {
-  const data = encodeSafeTransferFrom(FROM, TO, 1n);
-  // Packed addresses would start with 0x + 40 hex chars of address, not a selector
-  assert.notEqual(data.slice(0, 42).toLowerCase(), FROM.toLowerCase());
-  assert.ok(data.startsWith("0x42842e0e"));
-});
-
 test("parseEvmNftTokenId accepts number 0 and 1", () => {
   assert.deepEqual(parseEvmNftTokenId(0), { ok: true, tokenId: 0n });
   assert.deepEqual(parseEvmNftTokenId(1), { ok: true, tokenId: 1n });

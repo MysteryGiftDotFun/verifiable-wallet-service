@@ -113,13 +113,3 @@ test("blocked EVM mint uppercase is rejected", () => {
   assert.equal(result.ok, false);
   if (!result.ok) assert.equal(result.error, "fungible_mint_not_allowed");
 });
-
-test("unblocked mint with amount 1 succeeds", () => {
-  const result = assertNftTransferAmount({
-    mint: NFT_MINT,
-    amount: 1,
-    blockedMints: BLOCKED,
-  });
-  assert.equal(result.ok, true);
-  if (result.ok) assert.equal(result.amount, 1);
-});

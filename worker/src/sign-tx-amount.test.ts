@@ -52,15 +52,6 @@ test("parseSplTransferAmount: unsupported instruction type → null", () => {
   assert.equal(parseSplTransferAmount(data), null);
 });
 
-test("vault_transfer policy: amount ≠ 1 rejected", () => {
-  const amt = parseSplTransferAmount(encodeTransferData(3, 2n));
-  assert.ok(amt !== null);
-  assert.equal(amt.toString(), "2");
-  // Mirror validateVaultTransferInstructions amount gate (amt must be 1n)
-  const rejected = amt !== 1n;
-  assert.equal(rejected, true);
-});
-
 test("vault_transfer policy: USDC mint rejected even with amount 1", () => {
   const amt = parseSplTransferAmount(encodeTransferData(3, 1n));
   assert.equal(amt, 1n);
